@@ -38,8 +38,8 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.4.2.0")]
+[assembly: AssemblyFileVersion("1.4.2.0")]
 
 namespace DshPanel
 {
@@ -818,9 +818,10 @@ namespace DshPanel
             try { len = new FileInfo(file).Length; } catch { return cached; }
             if (offset < 0) { offset = 0; pending = ""; }
             if (len == offset) return cached;
-            if (len < offset) { offset = 0; pending = ""; }   // 被轮转/截断
+            if (len < offset) { offset = 0; pending = ""; cached = ""; }   // 被轮转/截断：旧内容失效，清空缓存
 
             long start = offset > 4 ? offset - 4 : 0;
+            long offsetBefore = offset;
             string chunk = "";
             try
             {
@@ -842,9 +843,27 @@ namespace DshPanel
             catch { return cached; }
             offset = len;
 
-            // 丢弃回退的 4 字节（最后一个换行之前的内容）
-            int nl = chunk.LastIndexOf('\n');
-            string newText = nl >= 0 ? chunk.Substring(nl + 1) : chunk;
+            // 回退区处理：仅当本次读取包含回退区（offset>4 的增量读取）时才需要丢弃。
+            // 回退区 = 上次偏移前 4 字节（用于避免 UTF-8 多字节字符被截断）；
+            // 在回退区（解码后前 <=4 个字符）内从后向前找换行：找到则丢弃到它为止；
+            // 找不到说明回退区在行中间，保留全部（最多开头出现少量碎片，罕见且无害）。
+            // 首次读取（offset==0）与轮转后整读不存在截断问题，直接全取——
+            // 旧实现用 LastIndexOf('\n') 无条件丢弃，当整块新内容以换行结尾时
+            // 会把全部内容误当回退区丢弃，导致日志区永远显示为空。
+            string newText = chunk;
+            if (offsetBefore > 4)
+            {
+                int limit = Math.Min(4, chunk.Length);
+                int nlInBackoff = -1;
+                for (int i = limit - 1; i >= 0; i--)
+                {
+                    if (chunk[i] == '\n') { nlInBackoff = i; break; }
+                }
+                if (nlInBackoff >= 0)
+                {
+                    newText = chunk.Substring(nlInBackoff + 1);
+                }
+            }
 
             string combined = pending + newText;
             List<string> lines = new List<string>();
