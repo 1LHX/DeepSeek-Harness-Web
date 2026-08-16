@@ -14,7 +14,7 @@ if errorlevel 1 (
 echo [test] Step 2/3: check for a running panel instance ...
 tasklist /FI "IMAGENAME eq dsh-panel.exe" | findstr /i "dsh-panel.exe" >nul
 if not errorlevel 1 (
-    echo [test] Panel is already running - skipping launch/kill (nothing to verify beyond build).
+    echo [test] Panel is already running - skipping launch/kill, build only.
     echo [test] PASS: build OK.
     exit /b 0
 )
