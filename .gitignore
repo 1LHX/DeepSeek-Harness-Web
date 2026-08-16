@@ -1,0 +1,19 @@
+# dsh-web panel - git ignore rules
+
+# ---- runtime artifacts (v1.4+) ----
+logs/
+run/
+*.log
+*.pid
+
+# ---- DSH harness tooling data (not project assets) ----
+.mimosa/
+
+# ---- editor / OS noise ----
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# Note: dsh-panel.exe and dsh-panel.ico are committed on purpose -
+# this is a portable, copy-and-run tool; the artifacts are the distribution.
