@@ -23,8 +23,27 @@ DeepSeek Harness Web（http://127.0.0.1:3080）的 Windows 原生控制面板。
 | `dsh-panel.manifest` | DPI 感知清单（PerMonitorV2） |
 | `dsh-panel.ico` / `generate-icon.ps1` | 程序图标与生成脚本 |
 | `install-autostart.cmd` / `uninstall-autostart.cmd` | 开机自启注册/注销（也可用托盘菜单勾选） |
+| `run-tests.cmd` | 一键冒烟测试（编译 + 面板启动存活检查，不影响服务） |
+| `.gitignore` | 版本控制忽略规则（运行时产物、工具数据） |
 
-运行时产物：`dsh-web.log`（服务 stdout）、`dsh-web.err.log`（错误）、`dsh-web.pid`（服务进程 PID）、`dsh-web.selftest.log`（自检报告）。
+## 目录结构
+
+```
+dsh-web/
+├── dsh-panel.cs / dsh-panel.exe / dsh-panel.cmd   源码 / 产物 / 启动器
+├── build-dsh-panel.cmd / run-tests.cmd            构建 / 测试
+├── start-service.ps1 / stop-dsh.cmd               服务启停脚本
+├── dsh-web.config                                 共享配置
+├── README.md / .gitignore                         文档 / 忽略规则
+├── logs/                                          运行时日志（自动创建）
+│   ├── dsh-web.log         服务 stdout
+│   ├── dsh-web.err.log     错误
+│   └── dsh-web.selftest.log 自检报告
+└── run/                                           运行时状态（自动创建）
+    └── dsh-web.pid         服务进程 PID
+```
+
+运行时产物与源码分离（v1.4 起）；旧版本留在根目录的日志/PID 会在面板启动时自动迁移。
 
 ## 构建
 
@@ -41,7 +60,13 @@ dsh-panel.exe --selftest
 ```
 
 全程无界面：停止现有服务 → 启动 → 等待端口就绪 → 停止 → 验证进程树清理与 err.log。
-结果写入 `dsh-web.selftest.log`。**注意：自检会先停止 3080 上正在运行的服务。**
+结果写入 `logs\dsh-web.selftest.log`。**注意：自检会先停止 3080 上正在运行的服务。**
+
+## 测试
+
+```bat
+run-tests.cmd    # 编译 + 面板 GUI 冒烟（不触碰正在运行的服务）
+```
 
 ## 配置
 
@@ -74,7 +99,7 @@ stop-dsh.cmd --dry-run  # 预览将要终止的进程，不实际执行
 
 ## 排障
 
-1. 服务起不来 → 查看 `dsh-web.err.log`（面板日志区也会显示）
+1. 服务起不来 → 查看 `logs\dsh-web.err.log`（面板日志区也会显示）
 2. 端口被占 → `netstat -ano | findstr ":3080 "` 找监听者，或 `stop-dsh.cmd --dry-run`
-3. 面板异常 → `dsh-panel.exe --selftest` 跑一遍自检，看 `dsh-web.selftest.log`
+3. 面板异常 → `dsh-panel.exe --selftest` 跑一遍自检，看 `logs\dsh-web.selftest.log`
 4. 日志过大 → 启动时自动轮转（>5MB 保留一代 `dsh-web.log.1`）
