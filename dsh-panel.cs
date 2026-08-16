@@ -38,8 +38,8 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("1.4.2.0")]
-[assembly: AssemblyFileVersion("1.4.2.0")]
+[assembly: AssemblyVersion("1.4.3.0")]
+[assembly: AssemblyFileVersion("1.4.3.0")]
 
 namespace DshPanel
 {
@@ -1563,7 +1563,9 @@ namespace DshPanel
             TryBeginInvoke(delegate { PollTick(null); });
         }
 
-        // 日志读取：增量读取（只读新增部分），out 保留 15 行、err 保留 5 行
+        // 日志读取：增量读取（只读新增部分），out 保留 15 行、err 保留 5 行。
+        // 拼接顺序：err（stderr，如启动期 npm warn 等过程信息）在前，out（stdout，如
+        // 启动完成横幅）在后——与真实输出时间序一致（stderr 先于 stdout 产生）。
         string GetLogTail()
         {
             string o = outTail.Update(Program.OutLog);
@@ -1572,10 +1574,10 @@ namespace DshPanel
             {
                 return "（暂无日志：点击「启动服务」后，这里会实时显示服务输出）";
             }
-            string joined = o;
-            if (!string.IsNullOrEmpty(e))
+            string joined = e;
+            if (!string.IsNullOrEmpty(o))
             {
-                joined = joined.Length > 0 ? joined + Environment.NewLine + e : e;
+                joined = joined.Length > 0 ? joined + Environment.NewLine + o : o;
             }
             return joined;
         }
