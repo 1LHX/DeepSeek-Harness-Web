@@ -1,6 +1,6 @@
 // dsh-panel.cs - DeepSeek Harness Web 控制面板（原生 C# 版）
 // 编译：build-dsh-panel.cmd（使用 Windows 自带 csc.exe，无需安装任何东西）
-// 设计：单窗口常驻面板 + 系统托盘；服务后台隐藏启动，输出实时显示在日志区；
+// 设计：单窗口常驻面板 + 系统托盘；服务后台隐藏启动，活动日志实时显示；
 //       端口轮询与日志读取全部在后台线程，UI 线程零负担，拖动/缩放为原生速度。
 // 安全：本程序自身不调用任何进程启动 API——
 //       服务启动委托给同目录 start-service.ps1（参数全部为常量）；
@@ -12,11 +12,13 @@
 // v1.2（界面）：Theme 主题色系统；自绘渐变头部（Logo + URL + 状态胶囊徽章）；
 //       状态指示灯（光晕 + 启动/停止脉冲动画）；按钮几何图标 + 颜色平滑过渡 + 按下下沉；
 //       日志卡片轻投影；布局/间距/字体统一。
-// v1.3（体验）：托盘图标随服务状态变色（绿/灰/琥珀，动态生成）；
-//       托盘菜单新增：开机自启勾选 / 退出并停止服务 / 关于；托盘右键零阻塞（复用轮询状态）；
-//       启动失败与停止超时托盘气泡告警；selftest 增强（Job 绑定 / 进程树清理 / err.log 基线）。
-// v1.4（结构）：运行时产物目录化——日志迁至 logs/、PID 迁至 run/（含旧布局自动迁移）；
-//       新增 .gitignore 与版本控制；新增 run-tests.cmd 一键冒烟测试；README 目录结构章节。
+// v1.3（体验）：托盘图标随服务状态变色；托盘菜单（开机自启/退出并停止/关于）；
+//       托盘右键零阻塞；启动失败与停止超时气泡告警；selftest 增强。
+// v1.4（结构）：运行时产物目录化（logs/ run/）；.gitignore 与版本控制；run-tests.cmd。
+// v1.5（活动日志）：日志区升级为活动事件流——面板操作/状态事件 + 服务输出，
+//       每行带时间戳并按类型着色（事件蓝/绿/琥珀/红，stdout 深灰，stderr 暗红）；
+//       工具栏：清空视图 / 复制 / 打开日志目录 / 自动滚动开关；
+//       动态信息行：服务已运行时长 + 日志大小。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -38,11 +40,15 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("1.4.4.0")]
-[assembly: AssemblyFileVersion("1.4.4.0")]
+[assembly: AssemblyVersion("1.5.0.0")]
+[assembly: AssemblyFileVersion("1.5.0.0")]
 
 namespace DshPanel
 {
+    // ---------- 日志行类型（决定着色） ----------
+
+    enum LogKind { Info, Success, Warn, Error, ServiceOut, ServiceErr }
+
     // ---------- 主题（集中配色，便于统一调整） ----------
 
     static class Theme
@@ -181,10 +187,20 @@ namespace DshPanel
         internal static bool autoRestartEnabled;       // 崩溃自动恢复开关（默认关，托盘菜单切换）
         internal static int autoRestartCount;
         internal static long lastRestartTick;
+        internal static long serviceUpSince;           // 服务本次运行起始时刻（Environment.TickCount）
         static IntPtr serviceJob = IntPtr.Zero;        // 启动时绑定的 Job Object（停止时整树终止）
         static Mutex singleMutex;
         internal static MainForm Instance;
         internal static Action onStopped;               // 停止完成后回调（「退出并停止服务」用）
+
+        // 活动日志事件（任何线程可调，转发到 UI 线程渲染）
+        internal static void LogEvent(LogKind kind, string text)
+        {
+            if (Instance != null)
+            {
+                try { Instance.AppendEvent(kind, text); } catch { }
+            }
+        }
 
         [STAThread]
         static int Main(string[] args)
@@ -372,6 +388,12 @@ namespace DshPanel
             int pid;
             if (int.TryParse(pidText, out pid) && pid > 0 && pid < 100000) return pid;
             return 0;
+        }
+
+        // 资源管理器中定位日志文件
+        internal static void OpenLogFolder()
+        {
+            try { ShellExecuteW(IntPtr.Zero, "open", "explorer.exe", "/select,\"" + OutLog + "\"", null, 1); } catch { }
         }
 
         // ---------- 端口探测 ----------
@@ -602,6 +624,7 @@ namespace DshPanel
                 string msg = "端口 " + Port + " 在停止后仍被监听，可能有残留进程。可重试停止，或使用 stop-dsh.cmd。";
                 try { File.AppendAllText(ErrLog, "[stop-service] " + msg + Environment.NewLine, new UTF8Encoding(false)); } catch { }
                 ShowBalloon("停止服务异常", msg, ToolTipIcon.Warning);
+                LogEvent(LogKind.Warn, msg);
             }
             try { File.Delete(PidFile); } catch { }
         }
@@ -613,6 +636,7 @@ namespace DshPanel
             opState = OpState.Starting;
             autoOpenPending = true;
             manualStop = false;
+            LogEvent(LogKind.Info, "启动服务…");
             ThreadPool.QueueUserWorkItem(delegate
             {
                 bool failed = false;
@@ -626,6 +650,7 @@ namespace DshPanel
                     failed = true;
                     try { File.AppendAllText(ErrLog, "[start-service] " + ex.Message + Environment.NewLine, new UTF8Encoding(false)); } catch { }
                     ShowBalloon("启动失败", ex.Message, ToolTipIcon.Error);
+                    LogEvent(LogKind.Error, "启动失败：" + ex.Message);
                 }
                 finally
                 {
@@ -649,11 +674,13 @@ namespace DshPanel
             opState = OpState.Stopping;
             autoOpenPending = false;
             manualStop = true;
+            LogEvent(LogKind.Info, "停止服务…");
             ThreadPool.QueueUserWorkItem(delegate
             {
                 StopService();
                 opState = OpState.Idle;
                 RefreshUi();
+                LogEvent(LogKind.Info, "服务已停止");
                 Action cb = onStopped;
                 onStopped = null;
                 if (cb != null)
@@ -805,29 +832,24 @@ namespace DshPanel
     }
 
     // ---------- 增量日志尾部读取 ----------
-    // 只读取新增字节（记住偏移）；文件被轮转/截断（变小）时从头重读；
-    // 读取起点回退 4 字节并按最后一个换行丢弃，避免 UTF-8 多字节字符被截断产生乱码。
+    // 只读取新增字节（记住偏移），返回自上次调用以来的新行；
+    // 文件被轮转/截断（变小）时从头重读；读取起点回退 4 字节，
+    // 仅在回退区（前 <=4 字符）内找换行丢弃，避免 UTF-8 多字节截断与内容误丢。
 
     class LogTail
     {
-        int maxLines;
         long offset = -1;        // -1 = 尚未初始化（首次整读）
         string pending = "";     // 上次结尾的不完整行，等待下次拼接
-        string cached = "";      // 当前展示的尾部文本
 
-        public LogTail(int maxLines)
+        public List<string> UpdateNew(string file)
         {
-            this.maxLines = maxLines;
-        }
-
-        public string Update(string file)
-        {
-            if (!File.Exists(file)) return cached;
+            List<string> newLines = new List<string>();
+            if (!File.Exists(file)) return newLines;
             long len;
-            try { len = new FileInfo(file).Length; } catch { return cached; }
+            try { len = new FileInfo(file).Length; } catch { return newLines; }
             if (offset < 0) { offset = 0; pending = ""; }
-            if (len == offset) return cached;
-            if (len < offset) { offset = 0; pending = ""; cached = ""; }   // 被轮转/截断：旧内容失效，清空缓存
+            if (len == offset) return newLines;
+            if (len < offset) { offset = 0; pending = ""; }   // 被轮转/截断：从头部重读
 
             long start = offset > 4 ? offset - 4 : 0;
             long offsetBefore = offset;
@@ -849,16 +871,12 @@ namespace DshPanel
                     chunk = Encoding.UTF8.GetString(buf, 0, read);
                 }
             }
-            catch { return cached; }
+            catch { return newLines; }
             offset = len;
 
             // 回退区处理：仅当本次读取包含回退区（offset>4 的增量读取）时才需要丢弃。
-            // 回退区 = 上次偏移前 4 字节（用于避免 UTF-8 多字节字符被截断）；
             // 在回退区（解码后前 <=4 个字符）内从后向前找换行：找到则丢弃到它为止；
             // 找不到说明回退区在行中间，保留全部（最多开头出现少量碎片，罕见且无害）。
-            // 首次读取（offset==0）与轮转后整读不存在截断问题，直接全取——
-            // 旧实现用 LastIndexOf('\n') 无条件丢弃，当整块新内容以换行结尾时
-            // 会把全部内容误当回退区丢弃，导致日志区永远显示为空。
             string newText = chunk;
             if (offsetBefore > 4)
             {
@@ -875,7 +893,6 @@ namespace DshPanel
             }
 
             string combined = pending + newText;
-            List<string> lines = new List<string>();
             StringBuilder cur = new StringBuilder();
             for (int i = 0; i < combined.Length; i++)
             {
@@ -883,7 +900,7 @@ namespace DshPanel
                 if (c == '\r') continue;
                 if (c == '\n')
                 {
-                    lines.Add(cur.ToString());
+                    newLines.Add(cur.ToString());
                     cur.Length = 0;
                 }
                 else
@@ -892,16 +909,7 @@ namespace DshPanel
                 }
             }
             pending = cur.ToString();
-
-            List<string> all = new List<string>();
-            if (cached.Length > 0)
-            {
-                all.AddRange(cached.Split(new string[] { "\n" }, StringSplitOptions.None));
-            }
-            all.AddRange(lines);
-            while (all.Count > maxLines) all.RemoveAt(0);
-            cached = string.Join("\n", all.ToArray());
-            return cached;
+            return newLines;
         }
     }
 
@@ -914,16 +922,20 @@ namespace DshPanel
         Label lblHint;
         RoundedButton btnAction;
         RoundedButton btnBrowser;
-        TextBox logBox;
+        RichTextBox logBox;
+        Label lblLogInfo;
+        SmallButton btnLogClear;
+        SmallButton btnLogCopy;
+        SmallButton btnLogDir;
+        SmallButton btnLogScroll;
         System.Threading.Timer pollTimer;
         System.Windows.Forms.Timer pulseTimer;
         bool closed;
         int pollBusy;
         bool lastPollRunning;
 
-        LogTail outTail = new LogTail(15);
-        LogTail errTail = new LogTail(5);
-        string lastLogShown = "";
+        LogTail outTail = new LogTail();
+        LogTail errTail = new LogTail();
 
         NotifyIcon notify;
         ContextMenuStrip trayMenu;
@@ -935,6 +947,11 @@ namespace DshPanel
         bool balloonShown;
         bool reallyExit;
 
+        int logLineCount;           // 日志区当前行数（用于截断）
+        bool autoScroll = true;
+        const int LogMaxLines = 500;
+        const int LogTrimTo = 200;
+
         const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RunValueName = "DshPanel";
 
@@ -942,8 +959,8 @@ namespace DshPanel
         {
             Program.Instance = this;
             Text = "DeepSeek Harness Web";
-            ClientSize = new Size(440, 400);
-            MinimumSize = new Size(380, 330);
+            ClientSize = new Size(440, 432);
+            MinimumSize = new Size(380, 360);
             FormBorderStyle = FormBorderStyle.Sizable;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -957,6 +974,7 @@ namespace DshPanel
             Shown += delegate
             {
                 pollTimer = new System.Threading.Timer(PollTick, null, 0, 2000);
+                Program.LogEvent(LogKind.Info, "面板已启动 · 端口 " + Program.Port + " · " + Program.Url);
             };
             FormClosing += OnFormClosing;
             FormClosed += delegate
@@ -991,6 +1009,60 @@ namespace DshPanel
                     try { notify.ShowBalloonTip(2500, "dsh-panel", "已最小化到系统托盘，服务仍在后台运行。", ToolTipIcon.Info); } catch { }
                 }
             }
+        }
+
+        // ---------- 活动日志（事件流 + 服务输出，时间戳 + 着色） ----------
+
+        public void AppendEvent(LogKind kind, string text)
+        {
+            TryBeginInvoke(delegate
+            {
+                try { AppendLine(kind, text); } catch { }
+            });
+        }
+
+        void AppendLine(LogKind kind, string text)
+        {
+            if (text == null || text.Length == 0) return;
+            // 超长截断：删除最旧的 TrimTo 行
+            if (logLineCount >= LogMaxLines + LogTrimTo)
+            {
+                int idx = logBox.GetFirstCharIndexFromLine(LogTrimTo);
+                if (idx > 0)
+                {
+                    logBox.Select(0, idx);
+                    logBox.SelectedText = "";
+                    logLineCount -= LogTrimTo;
+                }
+            }
+            logLineCount++;
+            string ts = DateTime.Now.ToString("HH:mm:ss");
+            logBox.SelectionStart = logBox.TextLength;
+            logBox.SelectionLength = 0;
+            logBox.SelectionColor = Theme.TextFaint;          // 时间戳：浅灰
+            logBox.AppendText("[" + ts + "] ");
+            logBox.SelectionColor = LogKindColor(kind);       // 内容：按类型着色
+            logBox.AppendText(text);
+            logBox.AppendText(Environment.NewLine);
+            if (autoScroll)
+            {
+                logBox.SelectionStart = logBox.TextLength;
+                logBox.ScrollToCaret();
+            }
+        }
+
+        static Color LogKindColor(LogKind kind)
+        {
+            switch (kind)
+            {
+                case LogKind.Info: return Color.FromArgb(37, 99, 235);        // 蓝
+                case LogKind.Success: return Color.FromArgb(5, 150, 105);     // 绿
+                case LogKind.Warn: return Color.FromArgb(180, 83, 9);         // 琥珀
+                case LogKind.Error: return Color.FromArgb(220, 38, 38);       // 红
+                case LogKind.ServiceOut: return Color.FromArgb(55, 65, 81);   // 深灰
+                case LogKind.ServiceErr: return Color.FromArgb(185, 28, 28);  // 暗红
+            }
+            return Theme.TextStrong;
         }
 
         // ---------- 系统托盘 ----------
@@ -1224,7 +1296,7 @@ namespace DshPanel
             TableLayoutPanel layout = new TableLayoutPanel();
             layout.Dock = DockStyle.Fill;
             layout.ColumnCount = 1;
-            layout.RowCount = 6;
+            layout.RowCount = 7;
             layout.Padding = new Padding(0);
             layout.BackColor = Theme.Bg;
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
@@ -1233,7 +1305,8 @@ namespace DshPanel
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 18));    // 2: 提示
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));    // 3: 按钮
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));    // 4: 日志标题
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 5: 日志卡片
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));    // 5: 日志工具栏
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 6: 日志卡片
 
             // ---- 渐变头部：Logo + 标题 + URL + 状态徽章 ----
             header = new GradientHeader();
@@ -1319,7 +1392,7 @@ namespace DshPanel
             logTitleRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             Label lblLogTitle = new Label();
-            lblLogTitle.Text = "运行日志";
+            lblLogTitle.Text = "活动日志";
             lblLogTitle.Dock = DockStyle.Fill;
             lblLogTitle.TextAlign = ContentAlignment.MiddleLeft;
             lblLogTitle.Padding = new Padding(24, 0, 0, 0);
@@ -1327,32 +1400,100 @@ namespace DshPanel
             lblLogTitle.ForeColor = Theme.TextMuted;
             lblLogTitle.BackColor = Theme.Bg;
 
-            Label lblLogHint = new Label();
-            lblLogHint.Text = "每 2 秒自动刷新";
-            lblLogHint.Dock = DockStyle.Fill;
-            lblLogHint.TextAlign = ContentAlignment.MiddleRight;
-            lblLogHint.Padding = new Padding(0, 0, 24, 0);
-            lblLogHint.Font = new Font("Microsoft YaHei UI", 8F);
-            lblLogHint.ForeColor = Theme.TextFaint;
-            lblLogHint.BackColor = Theme.Bg;
-
             logTitleRow.Controls.Add(lblLogTitle, 0, 0);
-            logTitleRow.Controls.Add(lblLogHint, 1, 0);
+
+            // ---- 日志工具栏：信息 + 清空 / 复制 / 目录 / 自动滚动 ----
+            TableLayoutPanel toolbarRow = new TableLayoutPanel();
+            toolbarRow.Dock = DockStyle.Fill;
+            toolbarRow.Margin = new Padding(14, 0, 14, 2);
+            toolbarRow.BackColor = Theme.Bg;
+            toolbarRow.ColumnCount = 5;
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+
+            lblLogInfo = new Label();
+            lblLogInfo.Text = "";
+            lblLogInfo.Dock = DockStyle.Fill;
+            lblLogInfo.TextAlign = ContentAlignment.MiddleLeft;
+            lblLogInfo.Font = new Font("Microsoft YaHei UI", 8F);
+            lblLogInfo.ForeColor = Theme.TextFaint;
+            lblLogInfo.BackColor = Theme.Bg;
+
+            btnLogClear = new SmallButton("清空");
+            btnLogClear.Dock = DockStyle.Fill;
+            btnLogClear.Margin = new Padding(2, 3, 2, 3);
+            btnLogClear.Click += delegate
+            {
+                logBox.Clear();
+                logLineCount = 0;
+                Program.LogEvent(LogKind.Info, "日志视图已清空");
+            };
+
+            btnLogCopy = new SmallButton("复制");
+            btnLogCopy.Dock = DockStyle.Fill;
+            btnLogCopy.Margin = new Padding(2, 3, 2, 3);
+            btnLogCopy.Click += delegate
+            {
+                try
+                {
+                    if (logBox.TextLength > 0)
+                    {
+                        Clipboard.SetText(logBox.Text);
+                        Program.LogEvent(LogKind.Info, "日志已复制到剪贴板");
+                    }
+                }
+                catch { }
+            };
+
+            btnLogDir = new SmallButton("目录");
+            btnLogDir.Dock = DockStyle.Fill;
+            btnLogDir.Margin = new Padding(2, 3, 2, 3);
+            btnLogDir.Click += delegate
+            {
+                Program.LogEvent(LogKind.Info, "打开日志目录…");
+                Program.OpenLogFolder();
+            };
+
+            btnLogScroll = new SmallButton("自动滚动");
+            btnLogScroll.Dock = DockStyle.Fill;
+            btnLogScroll.Margin = new Padding(2, 3, 2, 3);
+            btnLogScroll.Click += delegate
+            {
+                autoScroll = !autoScroll;
+                btnLogScroll.IsOn = autoScroll;
+                if (autoScroll)
+                {
+                    logBox.SelectionStart = logBox.TextLength;
+                    logBox.ScrollToCaret();
+                }
+                Program.LogEvent(LogKind.Info, autoScroll ? "自动滚动已开启" : "自动滚动已关闭");
+            };
+            btnLogScroll.IsOn = true;
+
+            toolbarRow.Controls.Add(lblLogInfo, 0, 0);
+            toolbarRow.Controls.Add(btnLogClear, 1, 0);
+            toolbarRow.Controls.Add(btnLogCopy, 2, 0);
+            toolbarRow.Controls.Add(btnLogDir, 3, 0);
+            toolbarRow.Controls.Add(btnLogScroll, 4, 0);
 
             // ---- 日志卡片 ----
             CardPanel logCard = new CardPanel();
             logCard.Dock = DockStyle.Fill;
-            logCard.Margin = new Padding(14, 2, 14, 14);
+            logCard.Margin = new Padding(14, 0, 14, 14);
 
-            logBox = new TextBox();
+            logBox = new RichTextBox();
             logBox.Multiline = true;
             logBox.ReadOnly = true;
             logBox.Dock = DockStyle.Fill;
             logBox.BorderStyle = BorderStyle.None;
-            logBox.ScrollBars = ScrollBars.Vertical;
+            logBox.ScrollBars = RichTextBoxScrollBars.Vertical;
             logBox.Font = new Font("Consolas", 9F);
             logBox.BackColor = Theme.Card;
             logBox.ForeColor = Theme.TextStrong;
+            logBox.DetectUrls = false;
             logBox.TabStop = false;
             logCard.Controls.Add(logBox);
 
@@ -1361,11 +1502,12 @@ namespace DshPanel
             layout.Controls.Add(lblHint, 0, 2);
             layout.Controls.Add(btnRow, 0, 3);
             layout.Controls.Add(logTitleRow, 0, 4);
-            layout.Controls.Add(logCard, 0, 5);
+            layout.Controls.Add(toolbarRow, 0, 5);
+            layout.Controls.Add(logCard, 0, 6);
             Controls.Add(layout);
         }
 
-        // 后台线程轮询：仅在实际变化时才刷新 UI；防重入；附带崩溃自动恢复检测
+        // 后台线程轮询：防重入；崩溃自动恢复检测；状态机；活动日志刷新
         void PollTick(object state)
         {
             if (closed) return;
@@ -1374,6 +1516,25 @@ namespace DshPanel
             {
                 bool running = Program.IsPortOpen();
                 Program.lastRunning = running;
+
+                // 运行时长起点：首次检测到运行 / 停止后清零
+                if (running)
+                {
+                    if (!Program.everRan)
+                    {
+                        Program.everRan = true;
+                        Program.serviceUpSince = Environment.TickCount;
+                        Program.LogEvent(LogKind.Info, "服务正在运行 · " + Program.Url);
+                    }
+                    else if (Program.serviceUpSince == 0)
+                    {
+                        Program.serviceUpSince = Environment.TickCount;
+                    }
+                }
+                else
+                {
+                    Program.serviceUpSince = 0;
+                }
 
                 // ---- 崩溃自动恢复（默认关闭；托盘菜单开启） ----
                 if (Program.opState == Program.OpState.Idle && Program.autoRestartEnabled && !Program.manualStop)
@@ -1387,6 +1548,7 @@ namespace DshPanel
                             {
                                 Program.autoRestartEnabled = false;
                                 Program.autoRestartCount = 0;
+                                Program.LogEvent(LogKind.Error, "服务多次自动恢复失败，自动恢复已停用");
                                 TryBeginInvoke(delegate
                                 {
                                     try { if (notify != null) notify.ShowBalloonTip(3000, "dsh-panel", "服务多次自动恢复失败，已停止自动恢复。请手动检查。", ToolTipIcon.Warning); } catch { }
@@ -1396,18 +1558,15 @@ namespace DshPanel
                             {
                                 Program.lastRestartTick = now;
                                 Program.autoRestartCount++;
+                                Program.LogEvent(LogKind.Warn, "检测到服务异常退出，正在自动恢复…");
                                 Program.StartServiceAsync();
                             }
                         }
                     }
                 }
-                if (running)
+                if (running && Program.autoRestartCount > 0 && Environment.TickCount - Program.lastRestartTick > 20000)
                 {
-                    Program.everRan = true;
-                    if (Program.autoRestartCount > 0 && Environment.TickCount - Program.lastRestartTick > 20000)
-                    {
-                        Program.autoRestartCount = 0;
-                    }
+                    Program.autoRestartCount = 0;
                 }
                 lastPollRunning = running;
 
@@ -1479,36 +1638,50 @@ namespace DshPanel
                 }
                 bool btnEnabled = !(isStarting || isStopping);
                 bool pulse = isStarting || isStopping;
-                string logText = GetLogTail();
 
                 // 本次启动成功后端口首次就绪时自动打开浏览器一次
                 if (running && Program.autoOpenPending)
                 {
                     Program.autoOpenPending = false;
+                    Program.LogEvent(LogKind.Success, "服务已就绪 · " + Program.Url);
+                    Program.LogEvent(LogKind.Info, "正在打开浏览器…");
                     TryBeginInvoke(delegate { Program.OpenBrowser(); });
                 }
 
-                if (statusLine.StatusText != statusText ||
+                // 服务输出增量（err 在前、out 在后，与真实输出时间序一致）
+                List<string> newErr = errTail.UpdateNew(Program.ErrLog);
+                List<string> newOut = outTail.UpdateNew(Program.OutLog);
+
+                // 动态信息行：运行时长 + 日志大小
+                string infoText = BuildInfoText(running);
+
+                bool stateChanged = statusLine.StatusText != statusText ||
                     statusLine.StatusColor != statusColor ||
                     statusLine.Pulse != pulse ||
                     header.BadgeText != statusText ||
                     header.BadgeColor != statusColor ||
                     btnAction.Text != btnText ||
                     btnAction.Icon != btnIcon ||
-                    btnAction.Enabled != btnEnabled ||
-                    logText != lastLogShown)
+                    btnAction.Enabled != btnEnabled;
+
+                TryBeginInvoke(delegate
                 {
-                    string st = statusText; Color sc = statusColor;
-                    string bt = btnText; Color bn = btnNormal; Color bh = btnHover; Color bp = btnPress;
-                    ButtonIcon bi = btnIcon;
-                    bool be = btnEnabled;
-                    bool pu = pulse;
-                    bool run = running;
-                    string lt = logText;
-                    TryBeginInvoke(delegate
+                    try
                     {
-                        try
+                        // 活动日志（总是刷新）
+                        foreach (string s in newErr) AppendLine(LogKind.ServiceErr, s);
+                        foreach (string s in newOut) AppendLine(LogKind.ServiceOut, s);
+                        if (lblLogInfo.Text != infoText) lblLogInfo.Text = infoText;
+
+                        // 状态（仅变化时）
+                        if (stateChanged)
                         {
+                            string st = statusText; Color sc = statusColor;
+                            string bt = btnText; Color bn = btnNormal; Color bh = btnHover; Color bp = btnPress;
+                            ButtonIcon bi = btnIcon;
+                            bool be = btnEnabled;
+                            bool pu = pulse;
+                            bool run = running;
                             statusLine.SetStatus(st, sc, pu);
                             header.SetBadge(st, sc);
                             btnAction.Text = bt;
@@ -1536,23 +1709,52 @@ namespace DshPanel
                                 if (pulseTimer != null && pulseTimer.Enabled) pulseTimer.Stop();
                                 statusLine.StopPulse();
                             }
-                            if (lt != lastLogShown)
-                            {
-                                logBox.Text = lt;
-                                lastLogShown = lt;
-                                logBox.SelectionStart = logBox.TextLength;
-                                logBox.ScrollToCaret();
-                            }
                         }
-                        catch { }
-                    });
-                }
+                    }
+                    catch { }
+                });
             }
             catch { }
             finally
             {
                 Interlocked.Exchange(ref pollBusy, 0);
             }
+        }
+
+        // 信息行文本：运行时长 + 日志大小
+        string BuildInfoText(bool running)
+        {
+            string s;
+            if (running && Program.serviceUpSince > 0)
+            {
+                TimeSpan up = TimeSpan.FromMilliseconds(Environment.TickCount - Program.serviceUpSince);
+                s = "已运行 " + string.Format("{0:00}:{1:00}:{2:00}", (int)up.TotalHours, up.Minutes, up.Seconds);
+            }
+            else
+            {
+                s = "服务未运行";
+            }
+            s += " · 日志 " + FormatSize(GetLogBytes());
+            return s;
+        }
+
+        long GetLogBytes()
+        {
+            long total = 0;
+            try
+            {
+                if (File.Exists(Program.OutLog)) total += new FileInfo(Program.OutLog).Length;
+                if (File.Exists(Program.ErrLog)) total += new FileInfo(Program.ErrLog).Length;
+            }
+            catch { }
+            return total;
+        }
+
+        static string FormatSize(long bytes)
+        {
+            if (bytes < 1024) return bytes + " B";
+            if (bytes < 1024 * 1024) return string.Format("{0:0.0} KB", bytes / 1024.0);
+            return string.Format("{0:0.0} MB", bytes / 1048576.0);
         }
 
         void TryBeginInvoke(Action action)
@@ -1570,25 +1772,6 @@ namespace DshPanel
         public void ForceRefresh()
         {
             TryBeginInvoke(delegate { PollTick(null); });
-        }
-
-        // 日志读取：增量读取（只读新增部分），out 保留 15 行、err 保留 5 行。
-        // 拼接顺序：err（stderr，如启动期 npm warn 等过程信息）在前，out（stdout，如
-        // 启动完成横幅）在后——与真实输出时间序一致（stderr 先于 stdout 产生）。
-        string GetLogTail()
-        {
-            string o = outTail.Update(Program.OutLog);
-            string e = errTail.Update(Program.ErrLog);
-            if (string.IsNullOrEmpty(o) && string.IsNullOrEmpty(e))
-            {
-                return "（暂无日志：点击「启动服务」后，这里会实时显示服务输出）";
-            }
-            string joined = e;
-            if (!string.IsNullOrEmpty(o))
-            {
-                joined = joined.Length > 0 ? joined + Environment.NewLine + o : o;
-            }
-            return joined;
         }
     }
 
@@ -1908,6 +2091,66 @@ namespace DshPanel
                     g.FillRectangle(dim, ClientRectangle);
                 }
             }
+        }
+    }
+
+    // ---------- 小号扁平按钮（日志工具栏） ----------
+
+    class SmallButton : Button
+    {
+        bool hovering;
+        bool pressed;
+        bool isOn;
+
+        public bool IsOn
+        {
+            get { return isOn; }
+            set { isOn = value; Invalidate(); }
+        }
+
+        public SmallButton(string text)
+        {
+            Text = text;
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            Font = new Font("Microsoft YaHei UI", 8.5F, GraphicsUnit.Point);
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hovering = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hovering = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs mevent) { pressed = true; Invalidate(); base.OnMouseDown(mevent); }
+        protected override void OnMouseUp(MouseEventArgs mevent) { pressed = false; Invalidate(); base.OnMouseUp(mevent); }
+
+        protected override void OnPaint(PaintEventArgs pevent)
+        {
+            Graphics g = pevent.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            Color bg;
+            Color fg;
+            if (isOn)
+            {
+                bg = Color.FromArgb(191, 219, 254);    // 蓝底 = 开关开启
+                fg = Color.FromArgb(29, 78, 216);
+            }
+            else
+            {
+                bg = pressed ? Color.FromArgb(156, 163, 184)
+                     : hovering ? Color.FromArgb(209, 213, 219)
+                     : Color.FromArgb(229, 231, 235);
+                fg = Color.FromArgb(55, 65, 81);
+            }
+
+            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), 5))
+            using (SolidBrush brush = new SolidBrush(bg))
+            {
+                g.FillPath(brush, path);
+            }
+            TextRenderer.DrawText(g, Text, Font, ClientRectangle, fg,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
     }
 
