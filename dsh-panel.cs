@@ -38,8 +38,8 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("1.4.3.0")]
-[assembly: AssemblyFileVersion("1.4.3.0")]
+[assembly: AssemblyVersion("1.4.4.0")]
+[assembly: AssemblyFileVersion("1.4.4.0")]
 
 namespace DshPanel
 {
@@ -615,6 +615,7 @@ namespace DshPanel
             manualStop = false;
             ThreadPool.QueueUserWorkItem(delegate
             {
+                bool failed = false;
                 try
                 {
                     LaunchService();
@@ -622,13 +623,21 @@ namespace DshPanel
                 }
                 catch (Exception ex)
                 {
+                    failed = true;
                     try { File.AppendAllText(ErrLog, "[start-service] " + ex.Message + Environment.NewLine, new UTF8Encoding(false)); } catch { }
                     ShowBalloon("启动失败", ex.Message, ToolTipIcon.Error);
                 }
                 finally
                 {
-                    opState = OpState.Idle;
-                    RefreshUi();
+                    // 仅启动失败时由后台线程归位；成功路径保持 Starting，
+                    // 由 PollTick 按“端口就绪 / 启动进程已退出”判定 Idle——
+                    // 否则服务尚未就绪时状态提前回到 Idle，
+                    // 表现为按钮闪回“启动服务”、提示闪回“未运行”。
+                    if (failed)
+                    {
+                        opState = OpState.Idle;
+                        RefreshUi();
+                    }
                 }
             });
         }
