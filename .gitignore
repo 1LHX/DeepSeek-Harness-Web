@@ -6,6 +6,11 @@ run/
 *.log
 *.pid
 
+# ---- WebView2 runtime DLLs next to the exe (build copies them from lib/) ----
+/Microsoft.Web.WebView2.Core.dll
+/Microsoft.Web.WebView2.WinForms.dll
+/WebView2Loader.dll
+
 # ---- DSH harness tooling data (not project assets) ----
 .mimosa/
 
