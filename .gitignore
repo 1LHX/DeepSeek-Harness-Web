@@ -12,6 +12,7 @@ run/
 # ---- editor / OS noise ----
 .vscode/
 .idea/
+.zcode/
 Thumbs.db
 Desktop.ini
 

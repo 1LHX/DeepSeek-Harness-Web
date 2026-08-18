@@ -19,6 +19,21 @@
 //       每行带时间戳并按类型着色（事件蓝/绿/琥珀/红，stdout 深灰，stderr 暗红）；
 //       工具栏：清空视图 / 复制 / 打开日志目录 / 自动滚动开关；
 //       动态信息行：服务已运行时长 + 日志大小。
+// v2.0（内嵌网页）：不再依赖外部浏览器——主窗口新增「控制台 | 网页」标签页，
+//       内嵌 WebView2（Chromium）加载 DSH 界面；服务就绪自动切到网页并导航；
+//       服务停止/启动中显示主题占位页，恢复后自动回到真实页面；
+//       首次切到网页标签时窗口自动放大；WebView2 运行时缺失时回退打开系统浏览器。
+//       依赖：lib/（Microsoft.Web.WebView2 SDK，MIT）+ WebView2 Evergreen Runtime。
+//       selftest 修复：置 Starting 状态使 Job Object 绑定/pid 等待生效（v1.4 起失效）。
+// v3.0（网页化 UI）：主界面重构为「纯网页」——打开即自动启动服务并全屏显示内嵌网页；
+//       顶栏 40px 薄工具条（Logo+标题+URL / 后退前进刷新浏览器 / 状态胶囊 / 日志按钮）；
+//       窗口恢复最大化/全屏（MaximizeBox）；活动日志移至独立弹窗（LogWindow）；
+//       删除「打开网页」按钮与「控制台|网页」标签栏；托盘保留全部功能。
+// v3.1（设置与引导）：顶栏精简为 Logo+URL / 状态胶囊（启停）/ 设置按钮；
+//       新增设置页（SettingsWindow）：开机自启、崩溃自动恢复、启动时自动启动服务
+//       （偏好持久化到 HKCU 注册表）、DSH 包状态与重新检测、关于（版本/依赖/链接）；
+//       启动时检测 @deepseek-ai/dsh 是否可用——缺失则显示手动安装指引页，
+//       安装完成后点「重新检测」进入主界面（不内置下载）。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -35,13 +50,15 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
 
 [assembly: AssemblyTitle("DeepSeek Harness Web Panel")]
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("1.5.0.0")]
-[assembly: AssemblyFileVersion("1.5.0.0")]
+[assembly: AssemblyVersion("3.1.0.0")]
+[assembly: AssemblyFileVersion("3.1.0.0")]
 
 namespace DshPanel
 {
@@ -76,6 +93,11 @@ namespace DshPanel
         public static readonly Color BluePress = Color.FromArgb(29, 78, 216);
 
         public static readonly Color Amber = Color.FromArgb(245, 158, 11);
+
+        // 圆角体系（大圆角少棱角，各控件统一）
+        public const int RadiusCard = 14;      // 大卡片（设置分区 / 日志卡片）
+        public const int RadiusButton = 11;    // 主按钮
+        public const int RadiusSmall = 8;      // 工具栏小按钮
     }
 
     // ---------- 绘制工具 ----------
@@ -121,12 +143,21 @@ namespace DshPanel
                    Math.Abs(a.B - b.B) <= 2 && Math.Abs(a.A - b.A) <= 2;
         }
 
+        // 自绘控件先铺满父容器底色，避免圆角外残留黑块
+        public static void ClearBackground(Graphics g, Control c)
+        {
+            using (SolidBrush b = new SolidBrush(c.Parent != null ? c.Parent.BackColor : Theme.Bg))
+            {
+                g.FillRectangle(b, c.ClientRectangle);
+            }
+        }
+
         // 应用 Logo：渐变圆角方块 + 白色粗体 D
         public static void DrawLogo(Graphics g, int x, int y, int size)
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             Rectangle r = new Rectangle(x, y, size, size);
-            using (GraphicsPath path = RoundedRect(r, Math.Max(6, size / 4)))
+            using (GraphicsPath path = RoundedRect(r, Math.Max(8, size / 3)))
             using (LinearGradientBrush brush = new LinearGradientBrush(
                 new RectangleF(x, y, size, size), Theme.Indigo, Theme.Violet, 45F))
             {
@@ -363,6 +394,84 @@ namespace DshPanel
                 if (File.Exists(c)) return c;
             }
             return candidates[0];   // 找不到时返回默认路径，由调用方给出明确报错
+        }
+
+        // ---------- v3.1：偏好持久化（HKCU 注册表） ----------
+
+        const string PrefsKey = @"Software\DshPanel\Preferences";
+
+        internal static bool GetPref(string name, bool def)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(PrefsKey))
+                {
+                    if (key == null) return def;
+                    object v = key.GetValue(name);
+                    if (v is int) return ((int)v) != 0;
+                }
+            }
+            catch { }
+            return def;
+        }
+
+        internal static void SetPref(string name, bool val)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(PrefsKey))
+                {
+                    if (key != null) key.SetValue(name, val ? 1 : 0, RegistryValueKind.DWord);
+                }
+            }
+            catch { }
+        }
+
+        // ---------- v3.1：DeepSeek Harness 可用性检测与安装 ----------
+        // 与服务启动同架构：面板不直接执行命令，全部委托给同目录
+        // check-dsh.ps1 / install-dsh.ps1（参数全常量），结果经 run/ 结果文件回报。
+
+        internal static bool autoStartService = true;   // 启动时自动启动服务（设置页可关）
+
+        // 启动脚本并轮询结果文件（后台线程；超时返回 false）
+        static bool RunScriptWaitResult(string script, string resultFile, int timeoutMs, out string result)
+        {
+            result = null;
+            try
+            {
+                string helper = Path.Combine(ScriptRoot, script);
+                if (!File.Exists(helper)) return false;
+                string parameters = "-NoProfile -ExecutionPolicy Bypass -File \"" + helper + "\"";
+                IntPtr r = ShellExecuteW(IntPtr.Zero, "open", "powershell.exe", parameters, ScriptRoot, 0);
+                if (r.ToInt64() <= 32) return false;
+                long start = Environment.TickCount;
+                while (Environment.TickCount - start < timeoutMs)
+                {
+                    if (File.Exists(resultFile))
+                    {
+                        try { result = File.ReadAllText(resultFile).Trim(); } catch { }
+                        if (!string.IsNullOrEmpty(result)) return true;
+                    }
+                    Thread.Sleep(500);
+                }
+                return false;
+            }
+            catch { return false; }
+        }
+
+        // 异步检测（结果回调在后台线程；UI 侧自行转发）
+        internal static void CheckDshAsync(Action<bool> done)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string result;
+                bool ok = RunScriptWaitResult("check-dsh.ps1", Path.Combine(ScriptRoot, "run", "dsh-check.txt"), 30000, out result);
+                bool installed = ok && result == "installed";
+                if (done != null)
+                {
+                    try { done(installed); } catch { }
+                }
+            });
         }
 
         internal static bool IsJobAttached()
@@ -703,6 +812,45 @@ namespace DshPanel
             try { ShellExecuteW(IntPtr.Zero, "open", Url, null, null, 1); } catch { }
         }
 
+        // 打开外部链接（仅 http/https 公网地址；拒绝 localhost/环回/私有/保留地址）
+        internal static void OpenExternal(string url)
+        {
+            try
+            {
+                Uri u;
+                if (!Uri.TryCreate(url, UriKind.Absolute, out u)) return;
+                if (u.Scheme != Uri.UriSchemeHttp && u.Scheme != Uri.UriSchemeHttps) return;
+                string host = u.DnsSafeHost;
+                if (string.IsNullOrEmpty(host)) return;
+                if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)) return;
+                IPAddress addr;
+                if (IPAddress.TryParse(host, out addr))
+                {
+                    if (IPAddress.IsLoopback(addr)) return;
+                    if (addr.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        byte[] b = addr.GetAddressBytes();
+                        if (b[0] == 10 || b[0] == 127) return;                                   // 私有/环回
+                        if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return;                    // 私有
+                        if (b[0] == 192 && b[1] == 168) return;                                 // 私有
+                        if (b[0] == 169 && b[1] == 254) return;                                 // link-local
+                        if (b[0] == 0 || b[0] >= 224) return;                                   // 保留/组播
+                    }
+                    else if (addr.AddressFamily == AddressFamily.InterNetworkV6)
+                    {
+                        if (addr.IsIPv6LinkLocal || addr.IsIPv6SiteLocal) return;               // 链路/站点本地
+                    }
+                }
+                else
+                {
+                    string h = host.ToLowerInvariant();
+                    if (h.EndsWith(".local") || h.EndsWith(".lan") || h.EndsWith(".internal")) return;
+                }
+                ShellExecuteW(IntPtr.Zero, "open", url, null, null, 1);
+            }
+            catch { }
+        }
+
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr ShellExecuteW(IntPtr hwnd, string lpOperation, string lpFile, string lpParameters, string lpDirectory, int nShowCmd);
 
@@ -732,7 +880,11 @@ namespace DshPanel
                 if (IsPortOpen()) { SelfLog("SELFTEST exit=1"); return 1; }
 
                 LaunchService();
+                // selftest 直连底层方法，需手动置 Starting 状态——
+                // AttachServiceToJob 依赖它轮询 pid 文件并绑定 Job Object
+                opState = OpState.Starting;
                 AttachServiceToJob();
+                opState = OpState.Idle;
                 SelfLog(IsJobAttached() ? "PASS: Job Object 已绑定服务进程树" : "WARN: Job Object 绑定失败（停止时将回退到按 PID/端口终止）");
                 int pid = ReadPid();
                 SelfLog(pid > 0 ? "PASS: pid 文件已写入 (pid=" + pid + ")" : "FAIL: pid 文件未写入");
@@ -918,24 +1070,41 @@ namespace DshPanel
     class MainForm : Form
     {
         GradientHeader header;
-        StatusLine statusLine;
-        Label lblHint;
-        RoundedButton btnAction;
-        RoundedButton btnBrowser;
-        RichTextBox logBox;
-        Label lblLogInfo;
-        SmallButton btnLogClear;
-        SmallButton btnLogCopy;
-        SmallButton btnLogDir;
-        SmallButton btnLogScroll;
+        TableLayoutPanel rootLayout;
         System.Threading.Timer pollTimer;
-        System.Windows.Forms.Timer pulseTimer;
         bool closed;
         int pollBusy;
         bool lastPollRunning;
 
         LogTail outTail = new LogTail();
         LogTail errTail = new LogTail();
+
+        // v2.0：内嵌网页（WebView2）
+        WebView2 webView;
+        bool webViewInited;          // EnsureCoreWebView2Async 已完成
+        bool webViewFailed;          // 初始化失败（无运行时等）
+        bool webViewBusy;            // 初始化进行中（防重入）
+        bool webShowsApp;            // 当前显示真实页面（非占位页）
+        string webPlaceholderKind;   // 占位页状态："starting" / "down"
+
+        // v3.0：网页化 UI——顶栏状态胶囊 + 独立日志窗口
+        StatusCapsule statusCapsule; // 服务状态胶囊（点击启停）
+        LogWindow logWindow;         // 独立活动日志窗口（隐藏创建，点按钮弹出）
+
+        // v3.1：设置与 DSH 检测引导
+        SmallButton btnSettings;     // 打开设置页
+        SettingsWindow settingsWindow; // 设置页（隐藏创建）
+        Panel setupPanel;            // DSH 缺失时的提示引导页（覆盖网页区）
+        RoundedButton btnSetupRecheck;
+        Label setupTitle;
+        Label setupDesc;
+        Label setupStatus;
+        bool dshInstalled;           // 检测结果：dsh 包可用
+        bool dshChecked;             // 检测已完成
+
+        // 设置页读取的检测状态
+        public bool DshInstalled { get { return dshInstalled; } }
+        public bool DshChecked { get { return dshChecked; } }
 
         NotifyIcon notify;
         ContextMenuStrip trayMenu;
@@ -947,11 +1116,6 @@ namespace DshPanel
         bool balloonShown;
         bool reallyExit;
 
-        int logLineCount;           // 日志区当前行数（用于截断）
-        bool autoScroll = true;
-        const int LogMaxLines = 500;
-        const int LogTrimTo = 200;
-
         const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RunValueName = "DshPanel";
 
@@ -960,10 +1124,11 @@ namespace DshPanel
             Program.Instance = this;
             Text = "DeepSeek Harness Web";
             ClientSize = new Size(440, 432);
-            MinimumSize = new Size(380, 360);
+            MinimumSize = new Size(800, 560);
             FormBorderStyle = FormBorderStyle.Sizable;
-            MaximizeBox = false;
+            MaximizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
+            WindowState = FormWindowState.Maximized;
             BackColor = Theme.Bg;
             Font = new Font("Microsoft YaHei UI", 9F);
             DoubleBuffered = true;
@@ -971,17 +1136,30 @@ namespace DshPanel
             BuildUi();
             SetupTray();
 
+            // v3.0：隐藏创建日志窗口（事件直接渲染不丢失），点「日志」按钮弹出
+            logWindow = new LogWindow();
+            // v3.1：设置页（隐藏创建）
+            settingsWindow = new SettingsWindow(this);
+
             Shown += delegate
             {
                 pollTimer = new System.Threading.Timer(PollTick, null, 0, 2000);
                 Program.LogEvent(LogKind.Info, "面板已启动 · 端口 " + Program.Port + " · " + Program.Url);
+                Program.autoStartService = Program.GetPref("AutoStartService", true);
+                EnsureWebViewAsync();
+                SyncWebView(Program.lastRunning);
+                // v3.1：先检测 DeepSeek Harness 是否可用——缺失则进入下载引导页，
+                // 载入完成（或已就绪）后才自动启动服务
+                Program.CheckDshAsync(delegate(bool ok)
+                {
+                    TryBeginInvoke(delegate { OnDshCheckResult(ok); });
+                });
             };
             FormClosing += OnFormClosing;
             FormClosed += delegate
             {
                 closed = true;
                 if (pollTimer != null) pollTimer.Dispose();
-                if (pulseTimer != null) pulseTimer.Dispose();
                 if (notify != null)
                 {
                     notify.Visible = false;
@@ -992,6 +1170,21 @@ namespace DshPanel
                 {
                     lastTrayIcon.Dispose();
                     lastTrayIcon = null;
+                }
+                if (webView != null)
+                {
+                    try { webView.Dispose(); } catch { }
+                    webView = null;
+                }
+                if (logWindow != null)
+                {
+                    try { logWindow.Dispose(); } catch { }
+                    logWindow = null;
+                }
+                if (settingsWindow != null)
+                {
+                    try { settingsWindow.Dispose(); } catch { }
+                    settingsWindow = null;
                 }
             };
         }
@@ -1011,58 +1204,14 @@ namespace DshPanel
             }
         }
 
-        // ---------- 活动日志（事件流 + 服务输出，时间戳 + 着色） ----------
+        // ---------- 活动日志（v3.0 起转发到独立日志窗口） ----------
 
         public void AppendEvent(LogKind kind, string text)
         {
-            TryBeginInvoke(delegate
+            if (logWindow != null)
             {
-                try { AppendLine(kind, text); } catch { }
-            });
-        }
-
-        void AppendLine(LogKind kind, string text)
-        {
-            if (text == null || text.Length == 0) return;
-            // 超长截断：删除最旧的 TrimTo 行
-            if (logLineCount >= LogMaxLines + LogTrimTo)
-            {
-                int idx = logBox.GetFirstCharIndexFromLine(LogTrimTo);
-                if (idx > 0)
-                {
-                    logBox.Select(0, idx);
-                    logBox.SelectedText = "";
-                    logLineCount -= LogTrimTo;
-                }
+                logWindow.AppendEvent(kind, text);
             }
-            logLineCount++;
-            string ts = DateTime.Now.ToString("HH:mm:ss");
-            logBox.SelectionStart = logBox.TextLength;
-            logBox.SelectionLength = 0;
-            logBox.SelectionColor = Theme.TextFaint;          // 时间戳：浅灰
-            logBox.AppendText("[" + ts + "] ");
-            logBox.SelectionColor = LogKindColor(kind);       // 内容：按类型着色
-            logBox.AppendText(text);
-            logBox.AppendText(Environment.NewLine);
-            if (autoScroll)
-            {
-                logBox.SelectionStart = logBox.TextLength;
-                logBox.ScrollToCaret();
-            }
-        }
-
-        static Color LogKindColor(LogKind kind)
-        {
-            switch (kind)
-            {
-                case LogKind.Info: return Color.FromArgb(37, 99, 235);        // 蓝
-                case LogKind.Success: return Color.FromArgb(5, 150, 105);     // 绿
-                case LogKind.Warn: return Color.FromArgb(180, 83, 9);         // 琥珀
-                case LogKind.Error: return Color.FromArgb(220, 38, 38);       // 红
-                case LogKind.ServiceOut: return Color.FromArgb(55, 65, 81);   // 深灰
-                case LogKind.ServiceErr: return Color.FromArgb(185, 28, 28);  // 暗红
-            }
-            return Theme.TextStrong;
         }
 
         // ---------- 系统托盘 ----------
@@ -1079,6 +1228,9 @@ namespace DshPanel
 
             ToolStripMenuItem miOpen = new ToolStripMenuItem("打开面板");
             miOpen.Click += delegate { ShowPanel(); };
+
+            ToolStripMenuItem miEmbed = new ToolStripMenuItem("显示面板");
+            miEmbed.Click += delegate { ShowPanel(); };
 
             miToggle = new ToolStripMenuItem("启动服务");
             miToggle.Click += delegate
@@ -1176,7 +1328,7 @@ namespace DshPanel
         }
 
         // 开机自启（HKCU Run 键）读写
-        bool IsAutoStartEnabled()
+        public bool IsAutoStartEnabled()
         {
             try
             {
@@ -1243,7 +1395,7 @@ namespace DshPanel
                     using (Graphics g = Graphics.FromImage(bmp))
                     {
                         g.SmoothingMode = SmoothingMode.AntiAlias;
-                        using (GraphicsPath path = Ui.RoundedRect(new Rectangle(1, 1, 14, 14), 3))
+                        using (GraphicsPath path = Ui.RoundedRect(new Rectangle(1, 1, 14, 14), 4))
                         using (LinearGradientBrush b = new LinearGradientBrush(
                             new RectangleF(1, 1, 14, 14), Theme.Indigo, Theme.Violet, 45F))
                         {
@@ -1296,52 +1448,40 @@ namespace DshPanel
             TableLayoutPanel layout = new TableLayoutPanel();
             layout.Dock = DockStyle.Fill;
             layout.ColumnCount = 1;
-            layout.RowCount = 7;
+            layout.RowCount = 2;
             layout.Padding = new Padding(0);
             layout.BackColor = Theme.Bg;
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));    // 0: 渐变头部
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));    // 1: 状态行
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 18));    // 2: 提示
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));    // 3: 按钮
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));    // 4: 日志标题
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));    // 5: 日志工具栏
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 6: 日志卡片
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));    // 0: 顶栏
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 1: 网页（铺满）
+            rootLayout = layout;
 
-            // ---- 渐变头部：Logo + 标题 + URL + 状态徽章 ----
+            // ---- 顶栏：Header（左）+ 状态胶囊 + 设置（右） ----
+            TableLayoutPanel topRow = new TableLayoutPanel();
+            topRow.Dock = DockStyle.Fill;
+            topRow.ColumnCount = 3;
+            topRow.RowCount = 1;
+            topRow.BackColor = Theme.Card;
+            topRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118)); // 状态胶囊
+            topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));  // 设置按钮
+
+            // 左侧：Logo + 标题 + URL
             header = new GradientHeader();
             header.Dock = DockStyle.Fill;
             header.SetUrl(Program.Url);
 
-            // ---- 状态行：指示灯 + 状态文字 ----
-            statusLine = new StatusLine();
-            statusLine.Dock = DockStyle.Fill;
-            statusLine.SetStatus("检测中…", Theme.TextMuted, false);
-
-            // ---- 提示 ----
-            lblHint = new Label();
-            lblHint.Text = "自动检测端口 · 启动服务后自动打开浏览器 · 关闭窗口即最小化到托盘";
-            lblHint.Dock = DockStyle.Fill;
-            lblHint.TextAlign = ContentAlignment.MiddleCenter;
-            lblHint.Font = new Font("Microsoft YaHei UI", 8F);
-            lblHint.ForeColor = Theme.TextFaint;
-            lblHint.BackColor = Theme.Bg;
-
-            // ---- 按钮 ----
-            btnAction = new RoundedButton(Theme.Green, Theme.GreenHover, Theme.GreenPress);
-            btnAction.Text = "启动服务";
-            btnAction.SetIcon(ButtonIcon.Play);
-            btnAction.Dock = DockStyle.Fill;
-            btnAction.Margin = new Padding(0);
-            btnAction.Click += delegate
+            // 状态胶囊：绿=运行 / 红=未运行 / 琥珀=切换中，点击启停
+            statusCapsule = new StatusCapsule();
+            statusCapsule.Dock = DockStyle.Fill;
+            statusCapsule.Margin = new Padding(4, 6, 2, 6);
+            statusCapsule.SetStatus("检测中…", Theme.TextMuted);
+            statusCapsule.Click += delegate
             {
                 try
                 {
-                    if (Program.opState != Program.OpState.Idle)
-                    {
-                        return; // 启动/停止中：忽略重复点击（按钮本身已禁用）
-                    }
-                    // 用最近一次轮询结果决定动作，点击零阻塞（不做同步端口探测）
+                    if (Program.opState != Program.OpState.Idle) return; // 切换中忽略
                     if (Program.lastRunning) Program.StopServiceAsync(); else Program.StartServiceAsync();
                     TryBeginInvoke(delegate { PollTick(null); });
                 }
@@ -1352,159 +1492,309 @@ namespace DshPanel
                 }
             };
 
-            btnBrowser = new RoundedButton(Theme.Blue, Theme.BlueHover, Theme.BluePress);
-            btnBrowser.Text = "打开浏览器";
-            btnBrowser.SetIcon(ButtonIcon.Globe);
-            btnBrowser.Dock = DockStyle.Fill;
-            btnBrowser.Margin = new Padding(0);
-            btnBrowser.Click += delegate
+            // 设置按钮：打开设置页（含关于、偏好开关、DSH 状态与重新检测）
+            btnSettings = new SmallButton("设置");
+            btnSettings.Dock = DockStyle.Fill;
+            btnSettings.Margin = new Padding(2, 6, 12, 6);
+            btnSettings.Click += delegate { ShowSettingsWindow(); };
+
+            topRow.Controls.Add(header, 0, 0);
+            topRow.Controls.Add(statusCapsule, 1, 0);
+            topRow.Controls.Add(btnSettings, 2, 0);
+
+            layout.Controls.Add(topRow, 0, 0);
+
+            // ---- 网页：WebView2 直接铺满窗口（浏览器形态） ----
+            webView = new WebView2();
+            webView.Dock = DockStyle.Fill;
+            webView.DefaultBackgroundColor = Theme.Card;
+
+            rootLayout.Controls.Add(webView, 0, 1);
+
+            // v3.1：DSH 缺失时的下载引导页（覆盖网页区，默认隐藏）
+            BuildSetupPanel();
+            rootLayout.Controls.Add(setupPanel, 0, 1);
+            setupPanel.SendToBack();
+
+            Controls.Add(rootLayout);
+        }
+
+        // ---------- v2.0：内嵌网页（WebView2） ----------
+
+        // 打开独立日志窗口（首次显示时带 owner；之后仅激活）
+        void ShowLogWindow()
+        {
+            ShowLogWindowPublic();
+        }
+
+        public void ShowLogWindowPublic()
+        {
+            if (logWindow == null) return;
+            try
             {
-                if (Program.IsPortOpen())
+                if (!logWindow.Visible) logWindow.Show(this);
+                if (logWindow.WindowState == FormWindowState.Minimized) logWindow.WindowState = FormWindowState.Normal;
+                logWindow.Activate();
+            }
+            catch (Exception ex)
+            {
+                Program.LogEvent(LogKind.Error, "打开日志窗口失败：" + ex.Message);
+            }
+        }
+
+        // 打开设置页
+        void ShowSettingsWindow()
+        {
+            if (settingsWindow == null) return;
+            try
+            {
+                if (!settingsWindow.Visible) settingsWindow.Show(this);
+                if (settingsWindow.WindowState == FormWindowState.Minimized) settingsWindow.WindowState = FormWindowState.Normal;
+                settingsWindow.Activate();
+            }
+            catch (Exception ex)
+            {
+                Program.LogEvent(LogKind.Error, "打开设置失败：" + ex.Message);
+            }
+        }
+
+        // ---------- v3.1：DSH 安装引导 ----------
+
+        // 检测回调（UI 线程）：已就绪 → 关闭引导页并自动启动服务；缺失 → 引导页
+        void OnDshCheckResult(bool ok)
+        {
+            dshChecked = true;
+            dshInstalled = ok;
+            if (ok)
+            {
+                Program.LogEvent(LogKind.Success, "DeepSeek Harness 已就绪");
+                setupPanel.Visible = false;
+                try { webView.Visible = true; } catch { }
+                MaybeAutoStartService();
+            }
+            else
+            {
+                Program.LogEvent(LogKind.Warn, "未检测到 DeepSeek Harness，进入安装指引页");
+                ShowSetupPanel();
+            }
+        }
+
+        // 按偏好自动启动服务（仅在 dsh 可用后调用）
+        void MaybeAutoStartService()
+        {
+            if (Program.autoStartService && !Program.IsPortOpen())
+            {
+                Program.LogEvent(LogKind.Info, "检测到服务未运行，自动启动…");
+                Program.StartServiceAsync();
+            }
+        }
+
+        // 覆盖网页区的下载引导页（dsh 缺失时）
+        void BuildSetupPanel()
+        {
+            setupPanel = new Panel();
+            setupPanel.Dock = DockStyle.Fill;
+            setupPanel.BackColor = Theme.Bg;
+            setupPanel.Visible = false;
+
+            TableLayoutPanel center = new TableLayoutPanel();
+            center.Dock = DockStyle.Fill;
+            center.ColumnCount = 1;
+            center.RowCount = 5;
+            center.BackColor = Theme.Bg;
+            center.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            center.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            center.RowStyles.Add(new RowStyle(SizeType.Absolute, 110));
+            center.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
+            center.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            center.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            center.Padding = new Padding(60, 0, 60, 0);
+
+            setupTitle = new Label();
+            setupTitle.Text = "DeepSeek Harness 未安装";
+            setupTitle.Dock = DockStyle.Fill;
+            setupTitle.TextAlign = ContentAlignment.MiddleCenter;
+            setupTitle.Font = new Font("Segoe UI", 20F, FontStyle.Bold, GraphicsUnit.Point);
+            setupTitle.ForeColor = Theme.TextStrong;
+            setupTitle.BackColor = Theme.Bg;
+
+            setupDesc = new Label();
+            setupDesc.Text = "未检测到 DeepSeek Harness（@deepseek-ai/dsh）。\r\n" +
+                "请先手动安装，完成后点击「重新检测」即可进入控制面板：\r\n" +
+                "   npm install -g @deepseek-ai/dsh\r\n" +
+                "（或在命令行执行 npx @deepseek-ai/dsh --version 自动下载缓存）";
+            setupDesc.Dock = DockStyle.Fill;
+            setupDesc.TextAlign = ContentAlignment.MiddleCenter;
+            setupDesc.Font = new Font("Microsoft YaHei UI", 10F);
+            setupDesc.ForeColor = Theme.TextMuted;
+            setupDesc.BackColor = Theme.Bg;
+
+            btnSetupRecheck = new RoundedButton(Theme.Blue, Theme.BlueHover, Theme.BluePress);
+            btnSetupRecheck.Text = "重新检测";
+            btnSetupRecheck.Dock = DockStyle.Fill;
+            btnSetupRecheck.Margin = new Padding(140, 6, 140, 6);
+            btnSetupRecheck.Click += delegate
+            {
+                setupStatus.Text = "正在重新检测…";
+                setupStatus.ForeColor = Theme.TextFaint;
+                Program.LogEvent(LogKind.Info, "正在重新检测 DeepSeek Harness…");
+                Program.CheckDshAsync(delegate(bool ok)
                 {
-                    Program.OpenBrowser();
+                    TryBeginInvoke(delegate { OnDshCheckResult(ok); });
+                });
+            };
+
+            setupStatus = new Label();
+            setupStatus.Text = "";
+            setupStatus.Dock = DockStyle.Fill;
+            setupStatus.TextAlign = ContentAlignment.MiddleCenter;
+            setupStatus.Font = new Font("Microsoft YaHei UI", 8.5F);
+            setupStatus.ForeColor = Theme.TextFaint;
+            setupStatus.BackColor = Theme.Bg;
+
+            center.Controls.Add(setupTitle, 0, 0);
+            center.Controls.Add(setupDesc, 0, 1);
+            center.Controls.Add(btnSetupRecheck, 0, 2);
+            center.Controls.Add(setupStatus, 0, 3);
+
+            setupPanel.Controls.Add(center);
+        }
+
+        void ShowSetupPanel()
+        {
+            if (setupPanel == null) BuildSetupPanel();
+            setupStatus.Text = "";
+            setupStatus.ForeColor = Theme.TextFaint;
+            // WebView2 是原生 HWND 窗口，可能浮在引导页上层——先隐藏
+            try { webView.Visible = false; } catch { }
+            setupPanel.Visible = true;
+            setupPanel.BringToFront();
+        }
+
+        // 设置页回调：重新检测 dsh 可用性
+        public void RecheckDsh()
+        {
+            Program.LogEvent(LogKind.Info, "正在重新检测 DeepSeek Harness…");
+            Program.CheckDshAsync(delegate(bool ok)
+            {
+                TryBeginInvoke(delegate { OnDshCheckResult(ok); });
+            });
+        }
+
+        // 设置页回调：开机自启写入（与托盘菜单联动）
+        public void SetAutoStartEnabled(bool value)
+        {
+            SetAutoStart(value);
+            if (miAutoStart != null) miAutoStart.Checked = value;
+        }
+
+        // 设置页回调：崩溃自动恢复读写（与托盘菜单联动）
+        public bool IsAutoRestartEnabled()
+        {
+            return Program.autoRestartEnabled;
+        }
+
+        public void SetAutoRestartEnabled(bool value)
+        {
+            Program.autoRestartEnabled = value;
+            if (miAutoRestart != null) miAutoRestart.Checked = value;
+        }
+
+        // 惰性初始化 WebView2（UI 线程调用；await 后续自动回到 UI 线程）
+        async void EnsureWebViewAsync()
+        {
+            if (webViewInited || webViewFailed || webViewBusy) return;
+            webViewBusy = true;
+            try
+            {
+                // 用户数据目录放 run/（与运行时产物一致）；失败则退回默认目录
+                string dataDir = Path.Combine(Program.ScriptRoot, "run", "webview2-data");
+                CoreWebView2Environment env = null;
+                try { env = await CoreWebView2Environment.CreateAsync(null, dataDir); } catch { }
+                if (env == null) env = await CoreWebView2Environment.CreateAsync(null, null);
+                await webView.EnsureCoreWebView2Async(env);
+                webViewInited = true;
+                Program.LogEvent(LogKind.Info, "内嵌浏览器已就绪（WebView2）");
+                SyncWebView(Program.lastRunning);
+            }
+            catch (Exception ex)
+            {
+                webViewFailed = true;
+                Program.LogEvent(LogKind.Warn, "内嵌浏览器不可用，将使用系统浏览器：" + ex.Message);
+                ShowWebFallback();
+            }
+            finally
+            {
+                webViewBusy = false;
+            }
+        }
+
+        // 占位页（服务未运行 / 启动中）：主题风格内联 HTML，无外部资源
+        void ShowPlaceholder(string kind)
+        {
+            webPlaceholderKind = kind;
+            bool starting = kind == "starting";
+            string color = starting ? "#f59e0b" : "#9ca3af";
+            string title = starting ? "服务启动中…" : "服务未运行";
+            string sub = starting ? "端口就绪后自动加载 DSH 面板" : "点击「启动服务」后此处将显示 DSH 面板";
+            string html =
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>" +
+                "body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;" +
+                "background:#f5f7fa;font-family:'Microsoft YaHei UI',sans-serif;color:#6b7280;}" +
+                ".box{text-align:center}.dot{width:16px;height:16px;border-radius:50%;margin:0 auto 18px;" +
+                "background:" + color + ";box-shadow:0 0 12px " + color + "55;}" +
+                "h2{margin:0 0 10px;font-size:20px;color:#374151;font-weight:600}" +
+                "p{margin:0;font-size:13px}</style></head><body>" +
+                "<div class=\"box\"><div class=\"dot\"></div><h2>" + title + "</h2><p>" + sub + "</p></div>" +
+                "</body></html>";
+            try { webView.CoreWebView2.NavigateToString(html); } catch { }
+        }
+
+        // 服务状态 <-> 网页内容同步（UI 线程；PollTick 每 2s 驱动）
+        void SyncWebView(bool running)
+        {
+            if (!webViewInited || webViewFailed) return;
+            try
+            {
+                if (running)
+                {
+                    if (!webShowsApp)
+                    {
+                        webShowsApp = true;
+                        webPlaceholderKind = null;
+                        webView.CoreWebView2.Navigate(Program.Url);
+                    }
                 }
                 else
                 {
-                    MessageBox.Show(this, "服务未运行，请先点击「启动服务」。", "提示",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-            };
-
-            TableLayoutPanel btnRow = new TableLayoutPanel();
-            btnRow.Dock = DockStyle.Fill;
-            btnRow.Margin = new Padding(22, 4, 22, 4);
-            btnRow.BackColor = Theme.Bg;
-            btnRow.ColumnCount = 5;
-            btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 12F));
-            btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34F));
-            btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 8F));
-            btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34F));
-            btnRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 12F));
-            btnRow.Controls.Add(btnAction, 1, 0);
-            btnRow.Controls.Add(btnBrowser, 3, 0);
-
-            // ---- 日志标题行 ----
-            TableLayoutPanel logTitleRow = new TableLayoutPanel();
-            logTitleRow.Dock = DockStyle.Fill;
-            logTitleRow.ColumnCount = 2;
-            logTitleRow.BackColor = Theme.Bg;
-            logTitleRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            logTitleRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-            Label lblLogTitle = new Label();
-            lblLogTitle.Text = "活动日志";
-            lblLogTitle.Dock = DockStyle.Fill;
-            lblLogTitle.TextAlign = ContentAlignment.MiddleLeft;
-            lblLogTitle.Padding = new Padding(24, 0, 0, 0);
-            lblLogTitle.Font = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
-            lblLogTitle.ForeColor = Theme.TextMuted;
-            lblLogTitle.BackColor = Theme.Bg;
-
-            logTitleRow.Controls.Add(lblLogTitle, 0, 0);
-
-            // ---- 日志工具栏：信息 + 清空 / 复制 / 目录 / 自动滚动 ----
-            TableLayoutPanel toolbarRow = new TableLayoutPanel();
-            toolbarRow.Dock = DockStyle.Fill;
-            toolbarRow.Margin = new Padding(14, 0, 14, 2);
-            toolbarRow.BackColor = Theme.Bg;
-            toolbarRow.ColumnCount = 5;
-            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
-            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
-            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
-            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
-
-            lblLogInfo = new Label();
-            lblLogInfo.Text = "";
-            lblLogInfo.Dock = DockStyle.Fill;
-            lblLogInfo.TextAlign = ContentAlignment.MiddleLeft;
-            lblLogInfo.Font = new Font("Microsoft YaHei UI", 8F);
-            lblLogInfo.ForeColor = Theme.TextFaint;
-            lblLogInfo.BackColor = Theme.Bg;
-
-            btnLogClear = new SmallButton("清空");
-            btnLogClear.Dock = DockStyle.Fill;
-            btnLogClear.Margin = new Padding(2, 3, 2, 3);
-            btnLogClear.Click += delegate
-            {
-                logBox.Clear();
-                logLineCount = 0;
-                Program.LogEvent(LogKind.Info, "日志视图已清空");
-            };
-
-            btnLogCopy = new SmallButton("复制");
-            btnLogCopy.Dock = DockStyle.Fill;
-            btnLogCopy.Margin = new Padding(2, 3, 2, 3);
-            btnLogCopy.Click += delegate
-            {
-                try
-                {
-                    if (logBox.TextLength > 0)
+                    string kind = Program.opState == Program.OpState.Starting ? "starting" : "down";
+                    if (webShowsApp || webPlaceholderKind != kind)
                     {
-                        Clipboard.SetText(logBox.Text);
-                        Program.LogEvent(LogKind.Info, "日志已复制到剪贴板");
+                        webShowsApp = false;
+                        ShowPlaceholder(kind);
                     }
                 }
-                catch { }
-            };
+            }
+            catch { }
+        }
 
-            btnLogDir = new SmallButton("目录");
-            btnLogDir.Dock = DockStyle.Fill;
-            btnLogDir.Margin = new Padding(2, 3, 2, 3);
-            btnLogDir.Click += delegate
+        // WebView2 初始化失败：网页区显示提示（顶栏「浏览器」按钮仍可用）
+        void ShowWebFallback()
+        {
+            try
             {
-                Program.LogEvent(LogKind.Info, "打开日志目录…");
-                Program.OpenLogFolder();
-            };
-
-            btnLogScroll = new SmallButton("自动滚动");
-            btnLogScroll.Dock = DockStyle.Fill;
-            btnLogScroll.Margin = new Padding(2, 3, 2, 3);
-            btnLogScroll.Click += delegate
-            {
-                autoScroll = !autoScroll;
-                btnLogScroll.IsOn = autoScroll;
-                if (autoScroll)
-                {
-                    logBox.SelectionStart = logBox.TextLength;
-                    logBox.ScrollToCaret();
-                }
-                Program.LogEvent(LogKind.Info, autoScroll ? "自动滚动已开启" : "自动滚动已关闭");
-            };
-            btnLogScroll.IsOn = true;
-
-            toolbarRow.Controls.Add(lblLogInfo, 0, 0);
-            toolbarRow.Controls.Add(btnLogClear, 1, 0);
-            toolbarRow.Controls.Add(btnLogCopy, 2, 0);
-            toolbarRow.Controls.Add(btnLogDir, 3, 0);
-            toolbarRow.Controls.Add(btnLogScroll, 4, 0);
-
-            // ---- 日志卡片 ----
-            CardPanel logCard = new CardPanel();
-            logCard.Dock = DockStyle.Fill;
-            logCard.Margin = new Padding(14, 0, 14, 14);
-
-            logBox = new RichTextBox();
-            logBox.Multiline = true;
-            logBox.ReadOnly = true;
-            logBox.Dock = DockStyle.Fill;
-            logBox.BorderStyle = BorderStyle.None;
-            logBox.ScrollBars = RichTextBoxScrollBars.Vertical;
-            logBox.Font = new Font("Consolas", 9F);
-            logBox.BackColor = Theme.Card;
-            logBox.ForeColor = Theme.TextStrong;
-            logBox.DetectUrls = false;
-            logBox.TabStop = false;
-            logCard.Controls.Add(logBox);
-
-            layout.Controls.Add(header, 0, 0);
-            layout.Controls.Add(statusLine, 0, 1);
-            layout.Controls.Add(lblHint, 0, 2);
-            layout.Controls.Add(btnRow, 0, 3);
-            layout.Controls.Add(logTitleRow, 0, 4);
-            layout.Controls.Add(toolbarRow, 0, 5);
-            layout.Controls.Add(logCard, 0, 6);
-            Controls.Add(layout);
+                webView.Visible = false;
+                Label lbl = new Label();
+                lbl.Dock = DockStyle.Fill;
+                lbl.TextAlign = ContentAlignment.MiddleCenter;
+                lbl.Font = new Font("Microsoft YaHei UI", 10F);
+                lbl.ForeColor = Theme.TextMuted;
+                lbl.Text = "未检测到 WebView2 运行时，无法内嵌显示网页。\r\n" +
+                           "请安装 WebView2 Runtime（developer.microsoft.com/microsoft-edge/webview2/），\r\n" +
+                           "或使用顶栏「浏览器」按钮在系统浏览器中打开。";
+                rootLayout.Controls.Add(lbl, 0, 1);
+            }
+            catch { }
         }
 
         // 后台线程轮询：防重入；崩溃自动恢复检测；状态机；活动日志刷新
@@ -1596,56 +1886,41 @@ namespace DshPanel
 
                 string statusText;
                 Color statusColor;
-                string btnText;
-                Color btnNormal;
-                Color btnHover;
-                Color btnPress;
-                ButtonIcon btnIcon;
                 if (isStarting)
                 {
                     statusText = "启动中…";
                     statusColor = Theme.Amber;
-                    btnText = "启动中…";
-                    btnNormal = Color.FromArgb(148, 163, 184);
-                    btnHover = Color.FromArgb(148, 163, 184);
-                    btnPress = Color.FromArgb(148, 163, 184);
-                    btnIcon = ButtonIcon.Play;
                 }
                 else if (isStopping)
                 {
                     statusText = "停止中…";
                     statusColor = Theme.Amber;
-                    btnText = "停止中…";
-                    btnNormal = Color.FromArgb(148, 163, 184);
-                    btnHover = Color.FromArgb(148, 163, 184);
-                    btnPress = Color.FromArgb(148, 163, 184);
-                    btnIcon = ButtonIcon.Stop;
                 }
                 else
                 {
                     statusText = running ? "运行中" : "未运行";
                     statusColor = running ? Theme.Green : Theme.Red;
-                    btnText = running ? "停止服务" : "启动服务";
-                    btnIcon = running ? ButtonIcon.Stop : ButtonIcon.Play;
-                    if (running)
-                    {
-                        btnNormal = Theme.Red; btnHover = Theme.RedHover; btnPress = Theme.RedPress;
-                    }
-                    else
-                    {
-                        btnNormal = Theme.Green; btnHover = Theme.GreenHover; btnPress = Theme.GreenPress;
-                    }
                 }
-                bool btnEnabled = !(isStarting || isStopping);
                 bool pulse = isStarting || isStopping;
 
-                // 本次启动成功后端口首次就绪时自动打开浏览器一次
+                // 本次启动成功后端口首次就绪：内嵌网页优先，运行时缺失时回退系统浏览器
                 if (running && Program.autoOpenPending)
                 {
                     Program.autoOpenPending = false;
                     Program.LogEvent(LogKind.Success, "服务已就绪 · " + Program.Url);
-                    Program.LogEvent(LogKind.Info, "正在打开浏览器…");
-                    TryBeginInvoke(delegate { Program.OpenBrowser(); });
+                    if (webViewFailed)
+                    {
+                        Program.LogEvent(LogKind.Info, "正在打开浏览器…");
+                        TryBeginInvoke(delegate { Program.OpenBrowser(); });
+                    }
+                    else
+                    {
+                        TryBeginInvoke(delegate
+                        {
+                            EnsureWebViewAsync();
+                            SyncWebView(true);
+                        });
+                    }
                 }
 
                 // 服务输出增量（err 在前、out 在后，与真实输出时间序一致）
@@ -1655,61 +1930,29 @@ namespace DshPanel
                 // 动态信息行：运行时长 + 日志大小
                 string infoText = BuildInfoText(running);
 
-                bool stateChanged = statusLine.StatusText != statusText ||
-                    statusLine.StatusColor != statusColor ||
-                    statusLine.Pulse != pulse ||
-                    header.BadgeText != statusText ||
-                    header.BadgeColor != statusColor ||
-                    btnAction.Text != btnText ||
-                    btnAction.Icon != btnIcon ||
-                    btnAction.Enabled != btnEnabled;
+                // 内嵌网页随服务状态变化（占位页 <-> 真实页面）
+                if (webViewInited || webViewBusy)
+                {
+                    bool r = running;
+                    TryBeginInvoke(delegate { SyncWebView(r); });
+                }
 
                 TryBeginInvoke(delegate
                 {
                     try
                     {
-                        // 活动日志（总是刷新）
-                        foreach (string s in newErr) AppendLine(LogKind.ServiceErr, s);
-                        foreach (string s in newOut) AppendLine(LogKind.ServiceOut, s);
-                        if (lblLogInfo.Text != infoText) lblLogInfo.Text = infoText;
+                        // 活动日志（转发到独立日志窗口）
+                        foreach (string s in newErr) logWindow.AppendEvent(LogKind.ServiceErr, s);
+                        foreach (string s in newOut) logWindow.AppendEvent(LogKind.ServiceOut, s);
+                        logWindow.SetInfo(infoText);
 
-                        // 状态（仅变化时）
-                        if (stateChanged)
-                        {
-                            string st = statusText; Color sc = statusColor;
-                            string bt = btnText; Color bn = btnNormal; Color bh = btnHover; Color bp = btnPress;
-                            ButtonIcon bi = btnIcon;
-                            bool be = btnEnabled;
-                            bool pu = pulse;
-                            bool run = running;
-                            statusLine.SetStatus(st, sc, pu);
-                            header.SetBadge(st, sc);
-                            btnAction.Text = bt;
-                            btnAction.SetColors(bn, bh, bp);
-                            btnAction.SetIcon(bi);
-                            btnAction.Enabled = be;
-                            // 托盘状态图标：绿=运行 / 灰=未运行 / 琥珀=启动停止中
-                            Color dotColor = pu ? Theme.Amber : (run ? Theme.Green : Color.FromArgb(148, 163, 184));
-                            SetTrayStateIcon(dotColor);
-                            if (pu)
-                            {
-                                if (pulseTimer == null)
-                                {
-                                    pulseTimer = new System.Windows.Forms.Timer();
-                                    pulseTimer.Interval = 50;
-                                    pulseTimer.Tick += delegate
-                                    {
-                                        if (!statusLine.StepPulse()) pulseTimer.Stop();
-                                    };
-                                }
-                                if (!pulseTimer.Enabled) pulseTimer.Start();
-                            }
-                            else
-                            {
-                                if (pulseTimer != null && pulseTimer.Enabled) pulseTimer.Stop();
-                                statusLine.StopPulse();
-                            }
-                        }
+                        // 状态胶囊与托盘图标（内部去重，零开销）
+                        string st = statusText; Color sc = statusColor;
+                        bool run = running; bool pu = pulse;
+                        statusCapsule.SetStatus(st, sc);
+                        // 托盘状态图标：绿=运行 / 灰=未运行 / 琥珀=启动停止中
+                        Color dotColor = pu ? Theme.Amber : (run ? Theme.Green : Color.FromArgb(148, 163, 184));
+                        SetTrayStateIcon(dotColor);
                     }
                     catch { }
                 });
@@ -1775,16 +2018,579 @@ namespace DshPanel
         }
     }
 
-    // ---------- 渐变头部（Logo + 标题 + URL + 状态胶囊徽章） ----------
+    // ---------- v3.0 独立活动日志窗口（主界面网页化后，日志移入弹窗） ----------
+
+    class LogWindow : Form
+    {
+        RichTextBox logBox;
+        Label lblLogInfo;
+        SmallButton btnLogClear;
+        SmallButton btnLogCopy;
+        SmallButton btnLogDir;
+        SmallButton btnLogScroll;
+        bool autoScroll = true;
+        int logLineCount;           // 日志区当前行数（用于截断）
+        const int LogMaxLines = 500;
+        const int LogTrimTo = 200;
+
+        public LogWindow()
+        {
+            Text = "活动日志 · DeepSeek Harness Web";
+            Size = new Size(760, 500);
+            MinimumSize = new Size(480, 320);
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            BackColor = Theme.Bg;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            BuildUi();
+            // 关闭 = 隐藏（窗口对象由主窗体持有，随时可再次弹出）
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                if (e.CloseReason == CloseReason.UserClosing)
+                {
+                    e.Cancel = true;
+                    Hide();
+                }
+            };
+        }
+
+        void BuildUi()
+        {
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.ColumnCount = 1;
+            layout.RowCount = 3;
+            layout.BackColor = Theme.Bg;
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));    // 0: 标题
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));    // 1: 工具栏
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 2: 日志卡片
+
+            // ---- 标题行 ----
+            Label lblTitle = new Label();
+            lblTitle.Text = "活动日志";
+            lblTitle.Dock = DockStyle.Fill;
+            lblTitle.TextAlign = ContentAlignment.MiddleLeft;
+            lblTitle.Padding = new Padding(20, 0, 0, 0);
+            lblTitle.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+            lblTitle.ForeColor = Theme.TextMuted;
+            lblTitle.BackColor = Theme.Bg;
+
+            // ---- 工具栏：信息 + 清空 / 复制 / 目录 / 自动滚动 ----
+            TableLayoutPanel toolbarRow = new TableLayoutPanel();
+            toolbarRow.Dock = DockStyle.Fill;
+            toolbarRow.Margin = new Padding(14, 0, 14, 4);
+            toolbarRow.BackColor = Theme.Bg;
+            toolbarRow.ColumnCount = 5;
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            toolbarRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+
+            lblLogInfo = new Label();
+            lblLogInfo.Text = "";
+            lblLogInfo.Dock = DockStyle.Fill;
+            lblLogInfo.TextAlign = ContentAlignment.MiddleLeft;
+            lblLogInfo.Font = new Font("Microsoft YaHei UI", 8F);
+            lblLogInfo.ForeColor = Theme.TextFaint;
+            lblLogInfo.BackColor = Theme.Bg;
+
+            btnLogClear = new SmallButton("清空");
+            btnLogClear.Dock = DockStyle.Fill;
+            btnLogClear.Margin = new Padding(2, 3, 2, 3);
+            btnLogClear.Click += delegate
+            {
+                logBox.Clear();
+                logLineCount = 0;
+                Program.LogEvent(LogKind.Info, "日志视图已清空");
+            };
+
+            btnLogCopy = new SmallButton("复制");
+            btnLogCopy.Dock = DockStyle.Fill;
+            btnLogCopy.Margin = new Padding(2, 3, 2, 3);
+            btnLogCopy.Click += delegate
+            {
+                try
+                {
+                    if (logBox.TextLength > 0)
+                    {
+                        Clipboard.SetText(logBox.Text);
+                        Program.LogEvent(LogKind.Info, "日志已复制到剪贴板");
+                    }
+                }
+                catch { }
+            };
+
+            btnLogDir = new SmallButton("目录");
+            btnLogDir.Dock = DockStyle.Fill;
+            btnLogDir.Margin = new Padding(2, 3, 2, 3);
+            btnLogDir.Click += delegate
+            {
+                Program.LogEvent(LogKind.Info, "打开日志目录…");
+                Program.OpenLogFolder();
+            };
+
+            btnLogScroll = new SmallButton("自动滚动");
+            btnLogScroll.Dock = DockStyle.Fill;
+            btnLogScroll.Margin = new Padding(2, 3, 2, 3);
+            btnLogScroll.Click += delegate
+            {
+                autoScroll = !autoScroll;
+                btnLogScroll.IsOn = autoScroll;
+                if (autoScroll)
+                {
+                    logBox.SelectionStart = logBox.TextLength;
+                    logBox.ScrollToCaret();
+                }
+                Program.LogEvent(LogKind.Info, autoScroll ? "自动滚动已开启" : "自动滚动已关闭");
+            };
+            btnLogScroll.IsOn = true;
+
+            toolbarRow.Controls.Add(lblLogInfo, 0, 0);
+            toolbarRow.Controls.Add(btnLogClear, 1, 0);
+            toolbarRow.Controls.Add(btnLogCopy, 2, 0);
+            toolbarRow.Controls.Add(btnLogDir, 3, 0);
+            toolbarRow.Controls.Add(btnLogScroll, 4, 0);
+
+            // ---- 日志卡片 ----
+            CardPanel logCard = new CardPanel();
+            logCard.Dock = DockStyle.Fill;
+            logCard.Margin = new Padding(14, 0, 14, 14);
+
+            logBox = new RichTextBox();
+            logBox.Multiline = true;
+            logBox.ReadOnly = true;
+            logBox.Dock = DockStyle.Fill;
+            logBox.BorderStyle = BorderStyle.None;
+            logBox.ScrollBars = RichTextBoxScrollBars.Vertical;
+            logBox.Font = new Font("Consolas", 9F);
+            logBox.BackColor = Theme.Card;
+            logBox.ForeColor = Theme.TextStrong;
+            logBox.DetectUrls = false;
+            logBox.TabStop = false;
+            logCard.Controls.Add(logBox);
+
+            layout.Controls.Add(lblTitle, 0, 0);
+            layout.Controls.Add(toolbarRow, 0, 1);
+            layout.Controls.Add(logCard, 0, 2);
+            Controls.Add(layout);
+        }
+
+        // 任意线程可调用；窗口隐藏时也正常渲染（RichTextBox 无需可见）
+        public void AppendEvent(LogKind kind, string text)
+        {
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke((Action)delegate { AppendLine(kind, text); });
+                    return;
+                }
+                AppendLine(kind, text);
+            }
+            catch { }
+        }
+
+        void AppendLine(LogKind kind, string text)
+        {
+            if (text == null || text.Length == 0) return;
+            // 超长截断：删除最旧的 TrimTo 行
+            if (logLineCount >= LogMaxLines + LogTrimTo)
+            {
+                int idx = logBox.GetFirstCharIndexFromLine(LogTrimTo);
+                if (idx > 0)
+                {
+                    logBox.Select(0, idx);
+                    logBox.SelectedText = "";
+                    logLineCount -= LogTrimTo;
+                }
+            }
+            logLineCount++;
+            string ts = DateTime.Now.ToString("HH:mm:ss");
+            logBox.SelectionStart = logBox.TextLength;
+            logBox.SelectionLength = 0;
+            logBox.SelectionColor = Theme.TextFaint;          // 时间戳：浅灰
+            logBox.AppendText("[" + ts + "] ");
+            logBox.SelectionColor = LogKindColor(kind);       // 内容：按类型着色
+            logBox.AppendText(text);
+            logBox.AppendText(Environment.NewLine);
+            if (autoScroll)
+            {
+                logBox.SelectionStart = logBox.TextLength;
+                logBox.ScrollToCaret();
+            }
+        }
+
+        static Color LogKindColor(LogKind kind)
+        {
+            switch (kind)
+            {
+                case LogKind.Info: return Color.FromArgb(37, 99, 235);        // 蓝
+                case LogKind.Success: return Color.FromArgb(5, 150, 105);     // 绿
+                case LogKind.Warn: return Color.FromArgb(180, 83, 9);         // 琥珀
+                case LogKind.Error: return Color.FromArgb(220, 38, 38);       // 红
+                case LogKind.ServiceOut: return Color.FromArgb(55, 65, 81);   // 深灰
+                case LogKind.ServiceErr: return Color.FromArgb(185, 28, 28);  // 暗红
+            }
+            return Theme.TextStrong;
+        }
+
+        // 动态信息行（由主窗体 PollTick 转发）
+        public void SetInfo(string text)
+        {
+            try
+            {
+                if (lblLogInfo != null) lblLogInfo.Text = text;
+            }
+            catch { }
+        }
+    }
+
+    // ---------- v3.1 设置页（常规开关 / 服务 / 关于） ----------
+
+    class SettingsWindow : Form
+    {
+        MainForm owner;
+        Label lblDshStatus;
+        SmallButton btnRecheck;
+
+        public SettingsWindow(MainForm ownerForm)
+        {
+            owner = ownerForm;
+            Text = "设置 · DeepSeek Harness Web";
+            Size = new Size(640, 560);
+            MinimumSize = new Size(520, 420);
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            BackColor = Theme.Bg;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            BuildUi();
+            // 关闭 = 隐藏（窗口对象由主窗体持有）
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                if (e.CloseReason == CloseReason.UserClosing)
+                {
+                    e.Cancel = true;
+                    Hide();
+                }
+            };
+        }
+
+        // 每次显示时刷新 DSH 状态（数据来自主窗体检测结果）
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            RefreshDshStatus();
+        }
+
+        public void RefreshDshStatus()
+        {
+            if (lblDshStatus == null) return;
+            try
+            {
+                if (!owner.DshChecked)
+                {
+                    lblDshStatus.Text = "DeepSeek Harness：检测中…";
+                    lblDshStatus.ForeColor = Theme.TextMuted;
+                }
+                else if (owner.DshInstalled)
+                {
+                    lblDshStatus.Text = "DeepSeek Harness：已就绪";
+                    lblDshStatus.ForeColor = Theme.Green;
+                }
+                else
+                {
+                    lblDshStatus.Text = "DeepSeek Harness：未安装（主界面已显示下载引导页）";
+                    lblDshStatus.ForeColor = Theme.Red;
+                }
+            }
+            catch { }
+        }
+
+        void BuildUi()
+        {
+            TableLayoutPanel layout = new TableLayoutPanel();
+            layout.Dock = DockStyle.Fill;
+            layout.ColumnCount = 1;
+            layout.RowCount = 3;
+            layout.BackColor = Theme.Bg;
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 10));
+
+            // 标题
+            Label lblTitle = new Label();
+            lblTitle.Text = "设置";
+            lblTitle.Dock = DockStyle.Fill;
+            lblTitle.TextAlign = ContentAlignment.MiddleLeft;
+            lblTitle.Padding = new Padding(20, 0, 0, 0);
+            lblTitle.Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
+            lblTitle.ForeColor = Theme.TextStrong;
+            lblTitle.BackColor = Theme.Bg;
+
+            // 内容（可滚动，窗口缩小时不丢控件）
+            Panel scroll = new Panel();
+            scroll.Dock = DockStyle.Fill;
+            scroll.AutoScroll = true;
+            scroll.BackColor = Theme.Bg;
+
+            TableLayoutPanel body = new TableLayoutPanel();
+            body.Dock = DockStyle.Top;
+            body.AutoSize = true;
+            body.ColumnCount = 1;
+            body.BackColor = Theme.Bg;
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            body.Padding = new Padding(16, 4, 16, 16);
+
+            body.Controls.Add(MakeSection("常规", new Control[] {
+                MakeToggleRow("开机自启", "登录 Windows 后自动启动本面板",
+                    owner.IsAutoStartEnabled(), delegate(bool v) { owner.SetAutoStartEnabled(v); }),
+                MakeToggleRow("崩溃自动恢复", "服务异常退出时自动重新启动",
+                    owner.IsAutoRestartEnabled(), delegate(bool v) { owner.SetAutoRestartEnabled(v); }),
+                MakeToggleRow("启动时自动启动服务", "面板启动后自动运行 DSH 服务",
+                    Program.GetPref("AutoStartService", true), delegate(bool v)
+                    {
+                        Program.autoStartService = v;
+                        Program.SetPref("AutoStartService", v);
+                    })
+            }));
+            body.Controls.Add(MakeSection("服务", new Control[] {
+                MakeInfoRow("监听端口", "3080（dsh-web.config）"),
+                MakeDshStatusRow(),
+                MakeButtonRow(new string[] { "打开日志窗口", "打开日志目录", "打开系统浏览器" })
+            }));
+            body.Controls.Add(MakeSection("关于", new Control[] {
+                MakeAboutRow(),
+                MakeLinkRow("DeepSeek Harness 项目主页", "https://github.com/deepseek-ai/deepseek-harness")
+            }));
+
+            scroll.Controls.Add(body);
+            layout.Controls.Add(lblTitle, 0, 0);
+            layout.Controls.Add(scroll, 0, 1);
+            Controls.Add(layout);
+        }
+
+        // 分区卡片：标题 + 内容行
+        Control MakeSection(string title, Control[] rows)
+        {
+            CardPanel card = new CardPanel();
+            card.Dock = DockStyle.Top;
+            card.AutoSize = true;
+            card.Margin = new Padding(0, 0, 0, 10);
+
+            TableLayoutPanel inner = new TableLayoutPanel();
+            inner.Dock = DockStyle.Top;
+            inner.AutoSize = true;
+            inner.ColumnCount = 1;
+            inner.Padding = new Padding(18, 10, 18, 14);
+            inner.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+
+            Label lbl = new Label();
+            lbl.Text = title;
+            lbl.AutoSize = true;
+            lbl.Margin = new Padding(0, 0, 0, 6);
+            lbl.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+            lbl.ForeColor = Theme.TextMuted;
+            inner.Controls.Add(lbl);
+
+            foreach (Control r in rows)
+            {
+                r.Margin = new Padding(0, 3, 0, 3);
+                inner.Controls.Add(r);
+            }
+            card.Controls.Add(inner);
+            return card;
+        }
+
+        // 开关按钮
+        SmallButton MakeToggle(bool initial, Action<bool> onChange)
+        {
+            SmallButton b = new SmallButton(initial ? "开" : "关");
+            b.IsOn = initial;
+            b.Size = new Size(56, 26);
+            b.Margin = new Padding(10, 4, 0, 4);
+            b.Click += delegate
+            {
+                bool v = !b.IsOn;
+                b.IsOn = v;
+                b.Text = v ? "开" : "关";
+                if (onChange != null)
+                {
+                    try { onChange(v); } catch { }
+                }
+            };
+            return b;
+        }
+
+        // 开关行：名称+说明（左） / 开关（右）
+        Control MakeToggleRow(string name, string desc, bool initial, Action<bool> onChange)
+        {
+            TableLayoutPanel row = new TableLayoutPanel();
+            row.Dock = DockStyle.Top;
+            row.AutoSize = true;
+            row.ColumnCount = 2;
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));
+
+            Label lbl = new Label();
+            lbl.AutoSize = true;
+            lbl.Dock = DockStyle.Fill;
+            lbl.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+            lbl.ForeColor = Theme.TextStrong;
+            lbl.Text = name;
+            lbl.TextAlign = ContentAlignment.MiddleLeft;
+
+            Label descLbl = new Label();
+            descLbl.Text = desc;
+            descLbl.AutoSize = true;
+            descLbl.Dock = DockStyle.Fill;
+            descLbl.Font = new Font("Microsoft YaHei UI", 8F);
+            descLbl.ForeColor = Theme.TextFaint;
+            descLbl.TextAlign = ContentAlignment.MiddleLeft;
+
+            // 名称与说明同列纵向排布
+            TableLayoutPanel left = new TableLayoutPanel();
+            left.Dock = DockStyle.Top;
+            left.AutoSize = true;
+            left.ColumnCount = 1;
+            left.RowCount = 2;
+            left.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            left.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+            left.RowStyles.Add(new RowStyle(SizeType.Absolute, 18));
+            left.Controls.Add(lbl, 0, 0);
+            left.Controls.Add(descLbl, 0, 1);
+
+            row.Controls.Add(left, 0, 0);
+            row.Controls.Add(MakeToggle(initial, onChange), 1, 0);
+            return row;
+        }
+
+        // 只读信息行
+        Control MakeInfoRow(string name, string value)
+        {
+            TableLayoutPanel row = new TableLayoutPanel();
+            row.Dock = DockStyle.Top;
+            row.AutoSize = true;
+            row.ColumnCount = 2;
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+
+            Label n = new Label();
+            n.Text = name;
+            n.AutoSize = true;
+            n.Font = new Font("Microsoft YaHei UI", 9F);
+            n.ForeColor = Theme.TextMuted;
+            n.TextAlign = ContentAlignment.MiddleLeft;
+
+            Label v = new Label();
+            v.Text = value;
+            v.AutoSize = true;
+            v.Dock = DockStyle.Fill;
+            v.Font = new Font("Microsoft YaHei UI", 9F);
+            v.ForeColor = Theme.TextStrong;
+            v.TextAlign = ContentAlignment.MiddleLeft;
+
+            row.Controls.Add(n, 0, 0);
+            row.Controls.Add(v, 1, 0);
+            return row;
+        }
+
+        // DSH 状态 + 重新检测
+        Control MakeDshStatusRow()
+        {
+            TableLayoutPanel row = new TableLayoutPanel();
+            row.Dock = DockStyle.Top;
+            row.AutoSize = true;
+            row.ColumnCount = 2;
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
+
+            lblDshStatus = new Label();
+            lblDshStatus.Text = "DeepSeek Harness：检测中…";
+            lblDshStatus.AutoSize = true;
+            lblDshStatus.Dock = DockStyle.Fill;
+            lblDshStatus.Font = new Font("Microsoft YaHei UI", 9F);
+            lblDshStatus.ForeColor = Theme.TextMuted;
+            lblDshStatus.TextAlign = ContentAlignment.MiddleLeft;
+
+            btnRecheck = new SmallButton("重新检测");
+            btnRecheck.Size = new Size(84, 26);
+            btnRecheck.Margin = new Padding(10, 4, 0, 4);
+            btnRecheck.Click += delegate
+            {
+                lblDshStatus.Text = "DeepSeek Harness：检测中…";
+                lblDshStatus.ForeColor = Theme.TextMuted;
+                if (owner != null) owner.RecheckDsh();
+            };
+
+            row.Controls.Add(lblDshStatus, 0, 0);
+            row.Controls.Add(btnRecheck, 1, 0);
+            return row;
+        }
+
+        // 工具按钮行
+        Control MakeButtonRow(string[] labels)
+        {
+            TableLayoutPanel row = new TableLayoutPanel();
+            row.Dock = DockStyle.Top;
+            row.AutoSize = true;
+            row.ColumnCount = labels.Length;
+            for (int i = 0; i < labels.Length; i++) row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            string[] actions = { "log", "folder", "browser" };
+            for (int i = 0; i < labels.Length; i++)
+            {
+                string act = actions[i];
+                SmallButton b = new SmallButton(labels[i]);
+                b.AutoSize = true;
+                b.Margin = new Padding(0, 4, 8, 4);
+                b.Click += delegate
+                {
+                    if (owner == null) return;
+                    if (act == "log") owner.ShowLogWindowPublic();
+                    else if (act == "folder") Program.OpenLogFolder();
+                    else Program.OpenBrowser();
+                };
+                row.Controls.Add(b, i, 0);
+            }
+            return row;
+        }
+
+        // 关于文本
+        Control MakeAboutRow()
+        {
+            Label lbl = new Label();
+            lbl.Dock = DockStyle.Top;
+            lbl.AutoSize = true;
+            lbl.Font = new Font("Microsoft YaHei UI", 9F);
+            lbl.ForeColor = Theme.TextMuted;
+            lbl.Text = "dsh-web 控制面板  v" + Assembly.GetExecutingAssembly().GetName().Version + "\r\n" +
+                "DeepSeek Harness Web（@deepseek-ai/dsh）的 Windows 原生控制面板。\r\n" +
+                "自绘界面基于 .NET Framework 与 C# 5.0（零第三方 UI 依赖）；\r\n" +
+                "内嵌浏览器使用 WebView2（Chromium，MIT 许可）；服务管理使用 PowerShell 脚本。";
+            return lbl;
+        }
+
+        // 外部链接行
+        Control MakeLinkRow(string text, string url)
+        {
+            LinkLabel link = new LinkLabel();
+            link.Text = text;
+            link.AutoSize = true;
+            link.LinkColor = Theme.Blue;
+            link.Font = new Font("Microsoft YaHei UI", 9F);
+            link.Click += delegate { Program.OpenExternal(url); };
+            return link;
+        }
+    }
+
+    // ---------- v3.0 顶栏（Logo + 标题 + URL，浅色薄条） ----------
 
     class GradientHeader : Panel
     {
         string url = "";
-        string badgeText = "未运行";
-        Color badgeColor = Theme.Red;
-
-        public string BadgeText { get { return badgeText; } }
-        public Color BadgeColor { get { return badgeColor; } }
 
         public GradientHeader()
         {
@@ -1798,81 +2604,105 @@ namespace DshPanel
             Invalidate();
         }
 
-        public void SetBadge(string text, Color color)
-        {
-            badgeText = text;
-            badgeColor = color;
-            Invalidate();
-        }
-
-        protected override void OnPaintBackground(PaintEventArgs e)
+        // 注意：本控件设置了 AllPaintingInWmPaint，系统不会调用 OnPaintBackground，
+        // 全部绘制必须在 OnPaint 中完成，否则顶栏整块不绘制（残留黑块）
+        protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            // 主渐变
-            using (LinearGradientBrush brush = new LinearGradientBrush(ClientRectangle,
-                Theme.Indigo, Theme.Violet, 45F))
+            // 先铺满底色（自绘控件不自动清背景，缺省会残留黑块）
+            using (SolidBrush bgBrush = new SolidBrush(Theme.Card))
             {
-                g.FillRectangle(brush, ClientRectangle);
+                g.FillRectangle(bgBrush, 0, 0, Width, Height);
             }
-            // 右上装饰圆（微弱）
-            using (SolidBrush deco = new SolidBrush(Color.FromArgb(24, 255, 255, 255)))
-            {
-                g.FillEllipse(deco, Width - 64, -34, 108, 108);
-            }
-            // 底部 1px 深色分隔线
-            using (SolidBrush line = new SolidBrush(Color.FromArgb(46, 15, 23, 42)))
+
+            // 底部 1px 分隔线（柔和浅灰）
+            using (SolidBrush line = new SolidBrush(Color.FromArgb(238, 241, 245)))
             {
                 g.FillRectangle(line, 0, Height - 1, Width, 1);
             }
 
             // Logo
-            Ui.DrawLogo(g, 20, (Height - 38) / 2, 38);
+            Ui.DrawLogo(g, 14, (Height - 26) / 2, 26);
 
-            // 标题
-            using (Font f = new Font("Segoe UI", 13.5F, FontStyle.Bold, GraphicsUnit.Point))
+            // 标题（与 URL 同行，URL 灰色小字紧随）
+            using (Font titleFont = new Font("Segoe UI", 11F, FontStyle.Bold, GraphicsUnit.Point))
+            using (Font urlFont = new Font("Consolas", 8.5F, GraphicsUnit.Point))
             {
-                TextRenderer.DrawText(g, "DeepSeek Harness Web", f,
-                    new Rectangle(70, 11, Width - 180, 26), Color.White,
-                    TextFormatFlags.Left | TextFormatFlags.NoPadding);
-            }
-            // URL
-            using (Font f = new Font("Consolas", 9.5F, GraphicsUnit.Point))
-            {
-                TextRenderer.DrawText(g, url, f,
-                    new Rectangle(71, 40, Width - 180, 20), Color.FromArgb(224, 231, 255),
-                    TextFormatFlags.Left | TextFormatFlags.NoPadding);
-            }
-
-            // 右侧状态胶囊徽章
-            DrawBadge(g);
-        }
-
-        void DrawBadge(Graphics g)
-        {
-            using (Font f = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Bold, GraphicsUnit.Point))
-            {
-                int tw = TextRenderer.MeasureText(g, badgeText, f).Width;
-                int bw = tw + 30;
-                int bx = Width - bw - 16;
-                int by = (Height - 24) / 2;
-                Rectangle cap = new Rectangle(bx, by, bw, 24);
-
-                using (GraphicsPath path = Ui.RoundedRect(cap, 12))
-                using (SolidBrush fill = new SolidBrush(badgeColor))
-                {
-                    g.FillPath(fill, path);
-                }
-                // 白色小圆点
-                using (SolidBrush dot = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
-                {
-                    g.FillEllipse(dot, bx + 10, by + 9, 6, 6);
-                }
-                TextRenderer.DrawText(g, badgeText, f,
-                    new Rectangle(bx + 18, by, bw - 20, 24), Color.White,
+                TextRenderer.DrawText(g, "DeepSeek Harness Web", titleFont,
+                    new Rectangle(50, 0, Width - 200, Height), Color.FromArgb(31, 41, 55),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                int tw = TextRenderer.MeasureText(g, "DeepSeek Harness Web", titleFont).Width;
+                TextRenderer.DrawText(g, url, urlFont,
+                    new Rectangle(50 + tw + 16, 0, Width - 200 - tw - 16, Height), Theme.TextFaint,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             }
+        }
+    }
+
+    // ---------- 服务状态胶囊（顶栏：圆角填充 + 白字，点击启停） ----------
+
+    class StatusCapsule : Button
+    {
+        string statusText = "未运行";
+        Color statusColor = Theme.Red;
+        bool hovering;
+        bool pressed;
+
+        public string StatusText { get { return statusText; } }
+        public Color StatusColor { get { return statusColor; } }
+
+        public StatusCapsule()
+        {
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            Font = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
+            Cursor = Cursors.Hand;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        }
+
+        public void SetStatus(string text, Color color)
+        {
+            statusText = text;
+            statusColor = color;
+            // 同步 Text 属性：UI 自动化（UIA Name）与辅助功能依赖它
+            try { Text = text; } catch { }
+            Invalidate();
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hovering = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hovering = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs mevent) { pressed = true; Invalidate(); base.OnMouseDown(mevent); }
+        protected override void OnMouseUp(MouseEventArgs mevent) { pressed = false; Invalidate(); base.OnMouseUp(mevent); }
+
+        protected override void OnPaint(PaintEventArgs pevent)
+        {
+            Graphics g = pevent.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            // 先铺满父容器底色，圆角外不残留黑块
+            Ui.ClearBackground(g, this);
+
+            Color fill = statusColor;
+            if (pressed) fill = Ui.Darken(fill, 0.85F);
+            else if (hovering) fill = Ui.Darken(fill, 0.93F);
+
+            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), Height / 2))
+            using (SolidBrush brush = new SolidBrush(fill))
+            {
+                g.FillPath(brush, path);
+            }
+            // 状态白点 + 白字
+            int shift = pressed ? 1 : 0;
+            using (SolidBrush dot = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
+            {
+                g.FillEllipse(dot, 12, Height / 2 - 3 + shift, 6, 6);
+            }
+            TextRenderer.DrawText(g, statusText, Font,
+                new Rectangle(24, shift, Width - 28, Height), Color.White,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
     }
 
@@ -2055,9 +2885,10 @@ namespace DshPanel
         {
             Graphics g = pevent.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            Ui.ClearBackground(g, this);
 
             Color fill = Enabled ? currentColor : Ui.Darken(currentColor, 0.72F);
-            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), 9))
+            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), Theme.RadiusButton))
             using (SolidBrush brush = new SolidBrush(fill))
             {
                 g.FillPath(brush, path);
@@ -2128,23 +2959,24 @@ namespace DshPanel
         {
             Graphics g = pevent.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            Ui.ClearBackground(g, this);
 
             Color bg;
             Color fg;
             if (isOn)
             {
-                bg = Color.FromArgb(191, 219, 254);    // 蓝底 = 开关开启
-                fg = Color.FromArgb(29, 78, 216);
+                bg = Color.FromArgb(219, 234, 254);    // 淡蓝底 = 开关开启
+                fg = Color.FromArgb(30, 64, 175);
             }
             else
             {
-                bg = pressed ? Color.FromArgb(156, 163, 184)
-                     : hovering ? Color.FromArgb(209, 213, 219)
-                     : Color.FromArgb(229, 231, 235);
-                fg = Color.FromArgb(55, 65, 81);
+                bg = pressed ? Color.FromArgb(203, 213, 225)
+                     : hovering ? Color.FromArgb(226, 232, 240)
+                     : Color.FromArgb(238, 242, 247);
+                fg = Color.FromArgb(71, 85, 105);
             }
 
-            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), 5))
+            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), Theme.RadiusSmall))
             using (SolidBrush brush = new SolidBrush(bg))
             {
                 g.FillPath(brush, path);
@@ -2167,22 +2999,23 @@ namespace DshPanel
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            Ui.ClearBackground(g, this);
 
             Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
 
             // 底部轻投影（两圈半透明）
-            using (GraphicsPath shadow = Ui.RoundedRect(new Rectangle(1, 2, Width - 3, Height - 3), 10))
+            using (GraphicsPath shadow = Ui.RoundedRect(new Rectangle(1, 2, Width - 3, Height - 3), Theme.RadiusCard))
             using (SolidBrush sb = new SolidBrush(Color.FromArgb(10, 15, 23, 42)))
             {
                 g.FillPath(sb, shadow);
             }
-            using (GraphicsPath shadow = Ui.RoundedRect(new Rectangle(0, 1, Width - 1, Height - 1), 10))
+            using (GraphicsPath shadow = Ui.RoundedRect(new Rectangle(0, 1, Width - 1, Height - 1), Theme.RadiusCard))
             using (SolidBrush sb = new SolidBrush(Color.FromArgb(7, 15, 23, 42)))
             {
                 g.FillPath(sb, shadow);
             }
 
-            using (GraphicsPath path = Ui.RoundedRect(r, 10))
+            using (GraphicsPath path = Ui.RoundedRect(r, Theme.RadiusCard))
             using (SolidBrush brush = new SolidBrush(Theme.Card))
             using (Pen pen = new Pen(Theme.Border))
             {

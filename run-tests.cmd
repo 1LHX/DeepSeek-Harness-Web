@@ -21,7 +21,8 @@ if not errorlevel 1 (
 
 echo [test] Step 3/3: launch panel for a 4s smoke test ...
 start "" "%DIR%dsh-panel.exe"
-timeout /t 4 /nobreak >nul
+rem use the full path so a PATH override (e.g. Git Bash coreutils) cannot shadow timeout.exe
+"%WINDIR%\System32\timeout.exe" /t 4 /nobreak >nul 2>nul
 tasklist /FI "IMAGENAME eq dsh-panel.exe" | findstr /i "dsh-panel.exe" >nul
 if errorlevel 1 (
     echo [test] FAIL: panel exited during smoke test. See logs\dsh-web.err.log
