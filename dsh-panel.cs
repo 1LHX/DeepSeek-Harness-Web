@@ -34,6 +34,10 @@
 //       （偏好持久化到 HKCU 注册表）、DSH 包状态与重新检测、关于（版本/依赖/链接）；
 //       启动时检测 @deepseek-ai/dsh 是否可用——缺失则显示手动安装指引页，
 //       安装完成后点「重新检测」进入主界面（不内置下载）。
+// v3.1.1（优化）：检测前清理结果文件（杜绝读旧缓存）、PID 上限放宽、
+//       stop-dsh 注释过滤、设置页端口文案动态化；删除死代码（StatusLine/miEmbed 等）；
+//       开关重绘为胶囊拨动开关、设置页清除浏览器缓存、检测超时三态提示、
+//       状态胶囊 tooltip、设置页浏览器端口检查；关于文案单一来源（AboutText）。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -57,8 +61,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.1.0.0")]
-[assembly: AssemblyFileVersion("3.1.0.0")]
+[assembly: AssemblyVersion("3.1.1.0")]
+[assembly: AssemblyFileVersion("3.1.1.0")]
 
 namespace DshPanel
 {
@@ -286,7 +290,7 @@ namespace DshPanel
             string pidText = "";
             try { pidText = File.ReadAllText(PidFile).Trim(); } catch { }
             int pid;
-            if (int.TryParse(pidText, out pid) && pid > 0 && pid < 100000)
+            if (int.TryParse(pidText, out pid) && pid > 0)
             {
                 try
                 {
@@ -441,6 +445,9 @@ namespace DshPanel
             {
                 string helper = Path.Combine(ScriptRoot, script);
                 if (!File.Exists(helper)) return false;
+                // 先删除上一轮的结果文件：脚本异步启动（约 1 秒），
+                // 否则轮询可能读到旧缓存而秒回，未反映真实状态
+                try { File.Delete(resultFile); } catch { }
                 string parameters = "-NoProfile -ExecutionPolicy Bypass -File \"" + helper + "\"";
                 IntPtr r = ShellExecuteW(IntPtr.Zero, "open", "powershell.exe", parameters, ScriptRoot, 0);
                 if (r.ToInt64() <= 32) return false;
@@ -459,17 +466,22 @@ namespace DshPanel
             catch { return false; }
         }
 
+        // 检测结果三态：区分「未安装」与「检测超时」（避免超时被误判为未安装）
+        internal enum DshCheckState { Missing, Installed, Timeout }
+
         // 异步检测（结果回调在后台线程；UI 侧自行转发）
-        internal static void CheckDshAsync(Action<bool> done)
+        internal static void CheckDshAsync(Action<DshCheckState> done)
         {
             ThreadPool.QueueUserWorkItem(delegate
             {
                 string result;
                 bool ok = RunScriptWaitResult("check-dsh.ps1", Path.Combine(ScriptRoot, "run", "dsh-check.txt"), 30000, out result);
-                bool installed = ok && result == "installed";
+                DshCheckState state = ok
+                    ? (result == "installed" ? DshCheckState.Installed : DshCheckState.Missing)
+                    : DshCheckState.Timeout;
                 if (done != null)
                 {
-                    try { done(installed); } catch { }
+                    try { done(state); } catch { }
                 }
             });
         }
@@ -495,7 +507,7 @@ namespace DshPanel
             string pidText = "";
             try { pidText = File.ReadAllText(PidFile).Trim(); } catch { }
             int pid;
-            if (int.TryParse(pidText, out pid) && pid > 0 && pid < 100000) return pid;
+            if (int.TryParse(pidText, out pid) && pid > 0) return pid;
             return 0;
         }
 
@@ -710,7 +722,7 @@ namespace DshPanel
                 string pidText = "";
                 try { pidText = File.ReadAllText(PidFile).Trim(); } catch { }
                 int pid;
-                if (int.TryParse(pidText, out pid) && pid > 0 && pid < 100000)
+                if (int.TryParse(pidText, out pid) && pid > 0)
                 {
                     KillProcessTree(pid);
                 }
@@ -849,6 +861,16 @@ namespace DshPanel
                 ShellExecuteW(IntPtr.Zero, "open", url, null, null, 1);
             }
             catch { }
+        }
+
+        // 关于文案（单一来源：托盘「关于」与设置页「关于」分区共用）
+        internal static string AboutText()
+        {
+            Version v = Assembly.GetExecutingAssembly().GetName().Version;
+            return "dsh-web 控制面板  v" + v.ToString() + "\r\n" +
+                "DeepSeek Harness Web（@deepseek-ai/dsh）的 Windows 原生控制面板。\r\n" +
+                "自绘界面基于 .NET Framework 与 C# 5.0（零第三方 UI 依赖）；\r\n" +
+                "内嵌浏览器使用 WebView2（Chromium，MIT 许可）；服务管理使用 PowerShell 脚本。";
         }
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
@@ -1089,6 +1111,7 @@ namespace DshPanel
 
         // v3.0：网页化 UI——顶栏状态胶囊 + 独立日志窗口
         StatusCapsule statusCapsule; // 服务状态胶囊（点击启停）
+        ToolTip capsuleTip;          // 胶囊 tooltip（端口 + 运行时长）
         LogWindow logWindow;         // 独立活动日志窗口（隐藏创建，点按钮弹出）
 
         // v3.1：设置与 DSH 检测引导
@@ -1101,10 +1124,12 @@ namespace DshPanel
         Label setupStatus;
         bool dshInstalled;           // 检测结果：dsh 包可用
         bool dshChecked;             // 检测已完成
+        Program.DshCheckState dshState; // 最近一次检测的三态结果
 
         // 设置页读取的检测状态
         public bool DshInstalled { get { return dshInstalled; } }
         public bool DshChecked { get { return dshChecked; } }
+        public Program.DshCheckState DshState { get { return dshState; } }
 
         NotifyIcon notify;
         ContextMenuStrip trayMenu;
@@ -1148,11 +1173,11 @@ namespace DshPanel
                 Program.autoStartService = Program.GetPref("AutoStartService", true);
                 EnsureWebViewAsync();
                 SyncWebView(Program.lastRunning);
-                // v3.1：先检测 DeepSeek Harness 是否可用——缺失则进入下载引导页，
-                // 载入完成（或已就绪）后才自动启动服务
-                Program.CheckDshAsync(delegate(bool ok)
+                // v3.1：先检测 DeepSeek Harness 是否可用——缺失则进入安装指引页，
+                // 就绪后才自动启动服务
+                Program.CheckDshAsync(delegate(Program.DshCheckState st)
                 {
-                    TryBeginInvoke(delegate { OnDshCheckResult(ok); });
+                    TryBeginInvoke(delegate { OnDshCheckResult(st); });
                 });
             };
             FormClosing += OnFormClosing;
@@ -1228,9 +1253,6 @@ namespace DshPanel
 
             ToolStripMenuItem miOpen = new ToolStripMenuItem("打开面板");
             miOpen.Click += delegate { ShowPanel(); };
-
-            ToolStripMenuItem miEmbed = new ToolStripMenuItem("显示面板");
-            miEmbed.Click += delegate { ShowPanel(); };
 
             miToggle = new ToolStripMenuItem("启动服务");
             miToggle.Click += delegate
@@ -1359,12 +1381,11 @@ namespace DshPanel
             catch { }
         }
 
+        // 关于文案（单一来源：托盘「关于」与设置页「关于」分区共用）
         // 关于对话框
         void ShowAbout()
         {
-            Version v = Assembly.GetExecutingAssembly().GetName().Version;
-            string msg = "dsh-panel v" + v.ToString() + "\n\n" +
-                "DeepSeek Harness Web 控制面板\n" +
+            string msg = Program.AboutText().Replace("\r\n", "\n") + "\n\n" +
                 "服务地址: " + Program.Url + "\n" +
                 "面板目录: " + Program.ScriptRoot + "\n\n" +
                 "开机自启: " + (IsAutoStartEnabled() ? "已启用" : "未启用") + "\n" +
@@ -1477,6 +1498,8 @@ namespace DshPanel
             statusCapsule.Dock = DockStyle.Fill;
             statusCapsule.Margin = new Padding(4, 6, 2, 6);
             statusCapsule.SetStatus("检测中…", Theme.TextMuted);
+            capsuleTip = new ToolTip();
+            capsuleTip.SetToolTip(statusCapsule, "端口 " + Program.Port);
             statusCapsule.Click += delegate
             {
                 try
@@ -1522,11 +1545,6 @@ namespace DshPanel
         // ---------- v2.0：内嵌网页（WebView2） ----------
 
         // 打开独立日志窗口（首次显示时带 owner；之后仅激活）
-        void ShowLogWindow()
-        {
-            ShowLogWindowPublic();
-        }
-
         public void ShowLogWindowPublic()
         {
             if (logWindow == null) return;
@@ -1560,22 +1578,30 @@ namespace DshPanel
 
         // ---------- v3.1：DSH 安装引导 ----------
 
-        // 检测回调（UI 线程）：已就绪 → 关闭引导页并自动启动服务；缺失 → 引导页
-        void OnDshCheckResult(bool ok)
+        // 检测回调（UI 线程）：已就绪 → 关闭引导页并自动启动服务；缺失/超时 → 引导页提示
+        void OnDshCheckResult(Program.DshCheckState state)
         {
             dshChecked = true;
-            dshInstalled = ok;
-            if (ok)
+            dshState = state;
+            dshInstalled = state == Program.DshCheckState.Installed;
+            if (state == Program.DshCheckState.Installed)
             {
                 Program.LogEvent(LogKind.Success, "DeepSeek Harness 已就绪");
                 setupPanel.Visible = false;
                 try { webView.Visible = true; } catch { }
                 MaybeAutoStartService();
             }
-            else
+            else if (state == Program.DshCheckState.Missing)
             {
                 Program.LogEvent(LogKind.Warn, "未检测到 DeepSeek Harness，进入安装指引页");
                 ShowSetupPanel();
+            }
+            else
+            {
+                Program.LogEvent(LogKind.Warn, "DeepSeek Harness 检测超时，请检查 Node.js 环境");
+                ShowSetupPanel();
+                setupStatus.Text = "检测超时：无法确认 DeepSeek Harness 状态，请检查 Node.js 后重新检测。";
+                setupStatus.ForeColor = Theme.Red;
             }
         }
 
@@ -1638,9 +1664,9 @@ namespace DshPanel
                 setupStatus.Text = "正在重新检测…";
                 setupStatus.ForeColor = Theme.TextFaint;
                 Program.LogEvent(LogKind.Info, "正在重新检测 DeepSeek Harness…");
-                Program.CheckDshAsync(delegate(bool ok)
+                Program.CheckDshAsync(delegate(Program.DshCheckState st)
                 {
-                    TryBeginInvoke(delegate { OnDshCheckResult(ok); });
+                    TryBeginInvoke(delegate { OnDshCheckResult(st); });
                 });
             };
 
@@ -1675,9 +1701,9 @@ namespace DshPanel
         public void RecheckDsh()
         {
             Program.LogEvent(LogKind.Info, "正在重新检测 DeepSeek Harness…");
-            Program.CheckDshAsync(delegate(bool ok)
+            Program.CheckDshAsync(delegate(Program.DshCheckState st)
             {
-                TryBeginInvoke(delegate { OnDshCheckResult(ok); });
+                TryBeginInvoke(delegate { OnDshCheckResult(st); });
             });
         }
 
@@ -1950,6 +1976,8 @@ namespace DshPanel
                         string st = statusText; Color sc = statusColor;
                         bool run = running; bool pu = pulse;
                         statusCapsule.SetStatus(st, sc);
+                        // 胶囊 tooltip：端口 + 运行时长/日志大小
+                        try { capsuleTip.SetToolTip(statusCapsule, "端口 " + Program.Port + "\n" + infoText); } catch { }
                         // 托盘状态图标：绿=运行 / 灰=未运行 / 琥珀=启动停止中
                         Color dotColor = pu ? Theme.Amber : (run ? Theme.Green : Color.FromArgb(148, 163, 184));
                         SetTrayStateIcon(dotColor);
@@ -2294,14 +2322,19 @@ namespace DshPanel
                     lblDshStatus.Text = "DeepSeek Harness：检测中…";
                     lblDshStatus.ForeColor = Theme.TextMuted;
                 }
-                else if (owner.DshInstalled)
+                else if (owner.DshState == Program.DshCheckState.Installed)
                 {
                     lblDshStatus.Text = "DeepSeek Harness：已就绪";
                     lblDshStatus.ForeColor = Theme.Green;
                 }
+                else if (owner.DshState == Program.DshCheckState.Timeout)
+                {
+                    lblDshStatus.Text = "DeepSeek Harness：检测超时（请检查 Node.js 后重新检测）";
+                    lblDshStatus.ForeColor = Theme.Amber;
+                }
                 else
                 {
-                    lblDshStatus.Text = "DeepSeek Harness：未安装（主界面已显示下载引导页）";
+                    lblDshStatus.Text = "DeepSeek Harness：未安装（主界面已显示安装指引页）";
                     lblDshStatus.ForeColor = Theme.Red;
                 }
             }
@@ -2357,9 +2390,9 @@ namespace DshPanel
                     })
             }));
             body.Controls.Add(MakeSection("服务", new Control[] {
-                MakeInfoRow("监听端口", "3080（dsh-web.config）"),
+                MakeInfoRow("监听端口", Program.Port + "（dsh-web.config）"),
                 MakeDshStatusRow(),
-                MakeButtonRow(new string[] { "打开日志窗口", "打开日志目录", "打开系统浏览器" })
+                MakeButtonRow(new string[] { "打开日志窗口", "打开日志目录", "打开系统浏览器", "清除浏览器缓存" })
             }));
             body.Controls.Add(MakeSection("关于", new Control[] {
                 MakeAboutRow(),
@@ -2404,24 +2437,20 @@ namespace DshPanel
             return card;
         }
 
-        // 开关按钮
-        SmallButton MakeToggle(bool initial, Action<bool> onChange)
+        // 胶囊拨动开关（On 状态在 Click 内已翻转，回调读取最新值）
+        ToggleSwitch MakeToggle(bool initial, Action<bool> onChange)
         {
-            SmallButton b = new SmallButton(initial ? "开" : "关");
-            b.IsOn = initial;
-            b.Size = new Size(56, 26);
-            b.Margin = new Padding(10, 4, 0, 4);
-            b.Click += delegate
+            ToggleSwitch t = new ToggleSwitch();
+            t.On = initial;
+            t.Margin = new Padding(10, 4, 0, 4);
+            t.Click += delegate
             {
-                bool v = !b.IsOn;
-                b.IsOn = v;
-                b.Text = v ? "开" : "关";
                 if (onChange != null)
                 {
-                    try { onChange(v); } catch { }
+                    try { onChange(t.On); } catch { }
                 }
             };
-            return b;
+            return t;
         }
 
         // 开关行：名称+说明（左） / 开关（右）
@@ -2530,7 +2559,7 @@ namespace DshPanel
             return row;
         }
 
-        // 工具按钮行
+        // 工具按钮行（日志窗口 / 日志目录 / 系统浏览器 / 清除浏览器缓存）
         Control MakeButtonRow(string[] labels)
         {
             TableLayoutPanel row = new TableLayoutPanel();
@@ -2539,7 +2568,7 @@ namespace DshPanel
             row.ColumnCount = labels.Length;
             for (int i = 0; i < labels.Length; i++) row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-            string[] actions = { "log", "folder", "browser" };
+            string[] actions = { "log", "folder", "browser", "clearcache" };
             for (int i = 0; i < labels.Length; i++)
             {
                 string act = actions[i];
@@ -2551,14 +2580,46 @@ namespace DshPanel
                     if (owner == null) return;
                     if (act == "log") owner.ShowLogWindowPublic();
                     else if (act == "folder") Program.OpenLogFolder();
-                    else Program.OpenBrowser();
+                    else if (act == "browser")
+                    {
+                        // 与托盘行为一致：服务未运行时不打开，避免浏览器报错页
+                        if (Program.IsPortOpen()) Program.OpenBrowser();
+                        else MessageBox.Show(this, "服务未运行，请先在主界面启动服务。", "提示",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    else ClearWebViewCache();
                 };
                 row.Controls.Add(b, i, 0);
             }
             return row;
         }
 
-        // 关于文本
+        // 清除内嵌浏览器缓存（run/webview2-data，下次启动自动重建）
+        void ClearWebViewCache()
+        {
+            string dir = Path.Combine(Program.ScriptRoot, "run", "webview2-data");
+            try
+            {
+                if (Directory.Exists(dir))
+                {
+                    Directory.Delete(dir, true);
+                    MessageBox.Show(this, "浏览器缓存已清除，下次启动内嵌网页时自动重建。", "提示",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    MessageBox.Show(this, "没有可清除的浏览器缓存。", "提示",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+            catch
+            {
+                MessageBox.Show(this, "清除失败：浏览器可能正在使用缓存（请先停止服务，或重启面板后重试）。", "提示",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        // 关于文本（与托盘「关于」共用 Program.AboutText 单一来源）
         Control MakeAboutRow()
         {
             Label lbl = new Label();
@@ -2566,10 +2627,7 @@ namespace DshPanel
             lbl.AutoSize = true;
             lbl.Font = new Font("Microsoft YaHei UI", 9F);
             lbl.ForeColor = Theme.TextMuted;
-            lbl.Text = "dsh-web 控制面板  v" + Assembly.GetExecutingAssembly().GetName().Version + "\r\n" +
-                "DeepSeek Harness Web（@deepseek-ai/dsh）的 Windows 原生控制面板。\r\n" +
-                "自绘界面基于 .NET Framework 与 C# 5.0（零第三方 UI 依赖）；\r\n" +
-                "内嵌浏览器使用 WebView2（Chromium，MIT 许可）；服务管理使用 PowerShell 脚本。";
+            lbl.Text = Program.AboutText();
             return lbl;
         }
 
@@ -2706,88 +2764,57 @@ namespace DshPanel
         }
     }
 
-    // ---------- 状态行（光晕指示灯 + 状态文字，启动/停止时脉冲） ----------
+    // ---------- 胶囊拨动开关（设置页：圆角轨道 + 圆形滑块） ----------
 
-    class StatusLine : Control
+    class ToggleSwitch : Control
     {
-        string statusText = "检测中…";
-        Color statusColor = Theme.TextMuted;
-        bool pulse;
-        float phase;
+        bool on;
+        bool hovering;
 
-        public string StatusText { get { return statusText; } }
-        public Color StatusColor { get { return statusColor; } }
-        public bool Pulse { get { return pulse; } }
+        public bool On
+        {
+            get { return on; }
+            set { on = value; Invalidate(); }
+        }
 
-        public StatusLine()
+        public ToggleSwitch()
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
                 ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            Cursor = Cursors.Hand;
+            Size = new Size(44, 24);
         }
 
-        public void SetStatus(string text, Color color, bool pulsing)
+        protected override void OnMouseEnter(EventArgs e) { hovering = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hovering = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnClick(EventArgs e)
         {
-            statusText = text;
-            statusColor = color;
-            pulse = pulsing;
-            if (!pulsing) phase = 0f;
-            Invalidate();
+            On = !On;
+            base.OnClick(e);
         }
 
-        public void StopPulse()
+        protected override void OnPaint(PaintEventArgs pevent)
         {
-            pulse = false;
-            phase = 0f;
-            Invalidate();
-        }
-
-        // 返回 true = 继续动画
-        public bool StepPulse()
-        {
-            if (!pulse) return false;
-            phase += 0.22F;
-            if (phase > (float)Math.PI * 2F) phase -= (float)Math.PI * 2F;
-            Invalidate();
-            return true;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            Graphics g = e.Graphics;
+            Graphics g = pevent.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            using (Font f = new Font("Microsoft YaHei UI", 15F, FontStyle.Bold, GraphicsUnit.Point))
+            // 轨道：开 = 主题蓝，关 = 灰；悬停略亮
+            Color track = on ? Color.FromArgb(59, 130, 246) : Color.FromArgb(209, 213, 219);
+            if (hovering) track = Ui.Darken(track, 0.92F);
+            Rectangle trackRect = new Rectangle(0, (Height - 16) / 2, Width - 1, 16);
+            using (GraphicsPath path = Ui.RoundedRect(trackRect, 8))
+            using (SolidBrush b = new SolidBrush(track))
             {
-                int tw = TextRenderer.MeasureText(g, statusText, f).Width;
-                int total = 26 + 12 + tw;
-                int startX = (Width - total) / 2;
-                int cx = startX + 13;
-                int cy = Height / 2;
-                int tx = startX + 26 + 12;
-
-                // 光晕（脉冲时呼吸）
-                float glow = pulse ? 0.65F + 0.35F * (float)Math.Sin(phase) : 0.85F;
-                using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(38 * glow), statusColor)))
-                {
-                    g.FillEllipse(b, cx - 26, cy - 26, 52, 52);
-                }
-                using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(62 * glow), statusColor)))
-                {
-                    g.FillEllipse(b, cx - 16, cy - 16, 32, 32);
-                }
-                // 实心点 + 白描边
-                using (SolidBrush dot = new SolidBrush(statusColor))
-                {
-                    g.FillEllipse(dot, cx - 7, cy - 7, 14, 14);
-                }
-                using (Pen pen = new Pen(Color.White, 2F))
-                {
-                    g.DrawEllipse(pen, cx - 7, cy - 7, 14, 14);
-                }
-
-                TextRenderer.DrawText(g, statusText, f,
-                    new Rectangle(tx, 0, tw + 4, Height), Theme.TextStrong,
-                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                g.FillPath(b, path);
+            }
+            // 滑块
+            int pad = 3;
+            int dia = 18;
+            int x = on ? Width - dia - pad : pad;
+            using (SolidBrush knob = new SolidBrush(Color.White))
+            {
+                g.FillEllipse(knob, x, (Height - dia) / 2, dia, dia);
             }
         }
     }

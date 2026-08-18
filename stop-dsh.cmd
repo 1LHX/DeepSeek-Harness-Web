@@ -14,7 +14,7 @@ if not exist "%PIDFILE%" if exist "%DIR%dsh-web.pid" set "PIDFILE=%DIR%dsh-web.p
 
 rem Read port from dsh-web.config (lines: port=NNNN)
 if exist "%DIR%dsh-web.config" (
-    for /f "usebackq tokens=1,* delims==" %%A in ("%DIR%dsh-web.config") do (
+    for /f "usebackq tokens=1,* delims==" %%A in ('findstr /b /v "#" "%DIR%dsh-web.config"') do (
         if /i "%%A"=="port" set "PORT=%%B"
     )
 )
