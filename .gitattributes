@@ -1,0 +1,10 @@
+# Keep blobs explicit about text vs binary so a clone on another machine behaves the same.
+# Text files: let git decide by content (no eol forcing -> no renormalization churn).
+* text=auto
+
+# Distribution artifacts must never be line-ending converted.
+*.exe binary
+*.dll binary
+*.ico binary
+*.png binary
+*.zstd binary

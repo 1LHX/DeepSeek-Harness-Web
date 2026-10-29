@@ -1,0 +1,1560 @@
+<!--
+  workbench/ui.html - DSH 工作台界面（v3.5）
+  不是一个独立页面：它被 dsh-workbench.cs 拆成三段注入进 DSH 页面，
+  挂在自己的 Shadow DOM 里（不碰 DSH 的 DOM / 全局 CSS），所以：
+    * 这里的 CSS 不需要任何前缀隔离以外的技巧；
+    * 这里的 JS 运行在页面主线程，但只能通过 chrome.webview.postMessage 跟面板通信。
+  三个分节标记（<!--@STYLE@--> 等）是契约，改名记得同步 dsh-workbench.cs 的 Section()。
+-->
+<!--@STYLE@-->
+<style>
+:host, .wb-app { all: initial; }
+.wb-app {
+  --wb-bg: #ffffff;
+  --wb-bg-soft: #f7f9fc;
+  --wb-bg-sunk: #eef2f8;
+  --wb-line: #e2e8f2;
+  --wb-line-strong: #cfd8e6;
+  --wb-text: #1f2a37;
+  --wb-text-soft: #5b6b82;
+  --wb-text-faint: #8b9ab1;
+  --wb-blue: #2563eb;
+  --wb-blue-soft: #eaf1ff;
+  --wb-green: #14a05a;
+  --wb-amber: #d97706;
+  --wb-red: #dc2626;
+  --wb-mono: Consolas, "Cascadia Mono", "JetBrains Mono", "Sarasa Mono SC", monospace;
+  --wb-sans: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  position: fixed; inset: 0; pointer-events: none; z-index: 2147483001;
+  font-family: var(--wb-sans); color: var(--wb-text); font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+.wb-app * { box-sizing: border-box; }
+.wb-app button { font-family: inherit; font-size: 12px; cursor: pointer; }
+.wb-app input, .wb-app select, .wb-app textarea { font-family: inherit; font-size: 12px; }
+
+/* ---------- 悬浮入口 ---------- */
+.wb-launcher {
+  position: fixed; right: 20px; bottom: 92px; pointer-events: auto;
+  display: flex; align-items: center; gap: 7px;
+  padding: 9px 15px 9px 12px; border: none; border-radius: 999px;
+  background: linear-gradient(135deg, #2b6cff, #1e4fd8); color: #fff;
+  font-weight: 600; font-size: 13px; letter-spacing: .2px;
+  box-shadow: 0 8px 22px rgba(37, 99, 235, .34), 0 1px 2px rgba(15, 23, 42, .2);
+  transition: transform .16s ease, box-shadow .16s ease, opacity .16s ease;
+}
+.wb-launcher:hover { transform: translateY(-1px); box-shadow: 0 12px 26px rgba(37, 99, 235, .42); }
+.wb-launcher:active { transform: translateY(0) scale(.985); }
+.wb-launcher .wb-kbd {
+  font: 600 10px/1 var(--wb-mono); background: rgba(255,255,255,.22);
+  padding: 3px 5px; border-radius: 5px;
+}
+.wb-app.wb-open .wb-launcher { opacity: 0; pointer-events: none; }
+
+/* ---------- 抽屉 ---------- */
+.wb-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(880px, 92vw);
+  pointer-events: auto; display: flex; flex-direction: column;
+  background: var(--wb-bg); border-left: 1px solid var(--wb-line-strong);
+  box-shadow: -18px 0 48px rgba(15, 23, 42, .16);
+  transform: translateX(102%); transition: transform .22s cubic-bezier(.2,.8,.2,1);
+}
+.wb-app.wb-open .wb-drawer { transform: translateX(0); }
+.wb-scrim {
+  position: fixed; inset: 0; pointer-events: none; opacity: 0;
+  background: rgba(15, 23, 42, .22); transition: opacity .22s ease;
+}
+.wb-app.wb-open .wb-scrim { opacity: 1; pointer-events: auto; }
+
+/* 头部 */
+.wb-head { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px 0; background: var(--wb-bg); }
+.wb-head-top { display: flex; align-items: center; gap: 10px; }
+.wb-logo {
+  width: 22px; height: 22px; border-radius: 7px; flex: none;
+  background: linear-gradient(135deg, #2b6cff, #1e4fd8);
+  box-shadow: 0 2px 6px rgba(37,99,235,.35); position: relative;
+}
+.wb-logo::after {
+  content: ""; position: absolute; inset: 6px; border-radius: 3px;
+  border: 1.6px solid #fff; border-top-color: transparent; border-right-color: transparent;
+}
+.wb-title { font-weight: 700; font-size: 14px; letter-spacing: .2px; }
+.wb-ver { font: 600 10px/1 var(--wb-mono); color: var(--wb-text-faint); background: var(--wb-bg-sunk); padding: 3px 5px; border-radius: 5px; }
+.wb-spacer { flex: 1; }
+.wb-ws {
+  display: flex; align-items: center; gap: 6px; max-width: 330px;
+  background: var(--wb-bg-soft); border: 1px solid var(--wb-line); border-radius: 7px;
+  padding: 4px 8px; cursor: pointer; color: var(--wb-text-soft); font-size: 11.5px;
+}
+.wb-ws:hover { border-color: var(--wb-line-strong); color: var(--wb-text); }
+.wb-ws-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--wb-mono); font-size: 11px; }
+.wb-icon-btn {
+  border: 1px solid transparent; background: transparent; color: var(--wb-text-soft);
+  width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; font-size: 14px;
+}
+.wb-icon-btn:hover { background: var(--wb-bg-sunk); color: var(--wb-text); }
+
+/* 页签 */
+.wb-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--wb-line); }
+.wb-tab {
+  border: none; background: transparent; color: var(--wb-text-soft); font-weight: 600;
+  padding: 9px 12px 10px; border-bottom: 2px solid transparent; margin-bottom: -1px; font-size: 12.5px;
+  display: flex; align-items: center; gap: 6px;
+}
+.wb-tab:hover { color: var(--wb-text); }
+.wb-tab.wb-on { color: var(--wb-blue); border-bottom-color: var(--wb-blue); }
+.wb-badge {
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px; background: var(--wb-bg-sunk);
+  color: var(--wb-text-soft); font: 600 10px/16px var(--wb-mono); text-align: center;
+}
+.wb-badge.wb-badge-hot { background: var(--wb-blue-soft); color: var(--wb-blue); }
+
+/* 主体 */
+.wb-body { flex: 1; min-height: 0; display: flex; }
+.wb-pane { display: none; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
+.wb-pane.wb-on { display: flex; }
+.wb-split { flex: 1; min-height: 0; display: flex; }
+.wb-col-side { width: 292px; flex: none; border-right: 1px solid var(--wb-line); display: flex; flex-direction: column; min-height: 0; background: var(--wb-bg-soft); }
+.wb-col-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.wb-toolbar {
+  display: flex; align-items: center; gap: 6px; padding: 7px 10px;
+  border-bottom: 1px solid var(--wb-line); background: var(--wb-bg); flex: none; min-height: 38px;
+}
+.wb-toolbar .wb-grow { flex: 1; min-width: 0; }
+.wb-search {
+  margin: 8px 10px; padding: 6px 9px; border: 1px solid var(--wb-line-strong); border-radius: 7px;
+  background: #fff; color: var(--wb-text); outline: none; font-size: 12px;
+}
+.wb-search:focus { border-color: var(--wb-blue); box-shadow: 0 0 0 3px var(--wb-blue-soft); }
+.wb-btn {
+  border: 1px solid var(--wb-line-strong); background: #fff; color: var(--wb-text);
+  padding: 4px 9px; border-radius: 6px; font-weight: 600; white-space: nowrap;
+}
+.wb-btn:hover { border-color: var(--wb-blue); color: var(--wb-blue); }
+.wb-btn.wb-primary { background: var(--wb-blue); border-color: var(--wb-blue); color: #fff; }
+.wb-btn.wb-primary:hover { background: #1d4ed8; color: #fff; }
+.wb-btn.wb-danger { background: var(--wb-red); border-color: var(--wb-red); color: #fff; }
+.wb-btn.wb-danger:hover { background: #b91c1c; color: #fff; }
+.wb-btn.wb-ghost { border-color: transparent; background: transparent; color: var(--wb-text-soft); }
+.wb-btn.wb-ghost:hover { background: var(--wb-bg-sunk); color: var(--wb-text); }
+.wb-btn:disabled { opacity: .45; cursor: default; }
+.wb-muted { color: var(--wb-text-faint); font-size: 11.5px; }
+.wb-mono { font-family: var(--wb-mono); }
+
+/* 文件树 */
+.wb-tree { flex: 1; overflow: auto; padding: 2px 6px 12px; font-size: 12px; }
+.wb-row {
+  display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 6px;
+  cursor: pointer; white-space: nowrap; overflow: hidden; color: var(--wb-text);
+}
+.wb-row:hover { background: #e9eff9; }
+.wb-row.wb-on { background: var(--wb-blue-soft); color: var(--wb-blue); font-weight: 600; }
+.wb-row .wb-arrow { width: 11px; flex: none; color: var(--wb-text-faint); font-size: 9px; text-align: center; }
+.wb-row .wb-ico { flex: none; opacity: .8; font-size: 12px; }
+.wb-row .wb-name { overflow: hidden; text-overflow: ellipsis; }
+.wb-row .wb-meta { margin-left: auto; font: 10px var(--wb-mono); color: var(--wb-text-faint); }
+.wb-children { margin-left: 12px; border-left: 1px dashed var(--wb-line); padding-left: 4px; }
+
+/* 预览 */
+.wb-view-head, .wb-diff-head, .wb-git-detail-head {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  border-bottom: 1px solid var(--wb-line); background: var(--wb-bg); flex: none; min-height: 38px;
+}
+.wb-file-path { font-family: var(--wb-mono); font-size: 11.5px; color: var(--wb-text-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-view-body { flex: 1; min-height: 0; overflow: auto; background: var(--wb-bg); }
+.wb-code { display: block; padding: 10px 0; font: 12px/1.55 var(--wb-mono); white-space: pre; tab-size: 4; }
+.wb-code .wb-line { display: flex; }
+.wb-code .wb-ln {
+  flex: none; width: 52px; text-align: right; padding-right: 10px; color: #b3bfd1;
+  user-select: none; font-size: 11px;
+}
+.wb-code .wb-src { padding-right: 16px; color: #24303f; }
+.wb-code tr:hover { background: #f5f8ff; }
+.wb-empty {
+  flex: 1; display: grid; place-items: center; color: var(--wb-text-faint);
+  font-size: 12.5px; padding: 24px; text-align: center; line-height: 1.7;
+}
+.wb-img { max-width: 100%; max-height: 100%; display: block; margin: 18px auto; box-shadow: 0 4px 18px rgba(15,23,42,.12); border-radius: 6px; }
+
+/* 终端 */
+.wb-term { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #0f172a; }
+.wb-term-bar {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px; flex: none;
+  background: #131c31; border-bottom: 1px solid #1f2a44; color: #9fb0cc;
+}
+.wb-term-bar select {
+  background: #1b2540; color: #cfe0ff; border: 1px solid #2b3a5f; border-radius: 6px; padding: 3px 6px; outline: none;
+}
+.wb-cwd { font: 11px var(--wb-mono); color: #7f95b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-policy {
+  font: 600 10.5px/1 var(--wb-mono); padding: 4px 7px; border-radius: 6px;
+  background: #1b2540; color: #8ea6cc; border: 1px solid #2b3a5f; white-space: nowrap;
+}
+.wb-policy.wb-allow { color: #6ee7a8; border-color: #1d6b45; background: #0f2a20; }
+.wb-policy.wb-ask { color: #fcd34d; border-color: #6b5320; background: #2a2007; }
+.wb-policy.wb-danger { color: #fca5a5; border-color: #7f1d1d; background: #2b0f0f; }
+.wb-term-out {
+  flex: 1; min-height: 0; overflow: auto; padding: 10px 12px 16px; color: #d5e2f5;
+  font: 12px/1.5 var(--wb-mono); white-space: pre-wrap; word-break: break-word;
+}
+.wb-term-out .wb-sys { color: #7f95b8; }
+.wb-term-out .wb-err { color: #fca5a5; }
+.wb-term-out .wb-ok { color: #6ee7a8; }
+.wb-term-out .wb-cmd-echo { color: #8ab4f8; font-weight: 600; }
+.wb-term-input { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #131c31; border-top: 1px solid #1f2a44; flex: none; }
+.wb-prompt { color: #6ee7a8; font: 600 13px var(--wb-mono); }
+.wb-cmd {
+  flex: 1; background: #0b1222; border: 1px solid #2b3a5f; border-radius: 6px; color: #e6eefc;
+  padding: 7px 9px; font: 12px var(--wb-mono); outline: none;
+}
+.wb-cmd:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.18); }
+.wb-confirm {
+  margin: 0 10px 8px; padding: 10px 12px; border-radius: 8px; flex: none;
+  border: 1px solid #7f1d1d; background: #2b0f0f; color: #fecaca; display: none; gap: 10px; align-items: center;
+}
+.wb-confirm.wb-on { display: flex; }
+.wb-confirm.wb-ask { border-color: #6b5320; background: #2a2007; color: #fcd34d; }
+.wb-confirm .wb-grow { flex: 1; min-width: 0; line-height: 1.55; font-size: 12px; }
+
+/* 任务看板 */
+.wb-tasks { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.wb-goal {
+  margin: 10px 12px 0; padding: 10px 12px; border-radius: 9px; flex: none;
+  background: linear-gradient(135deg, #f2f7ff, #eaf1ff); border: 1px solid #d8e5ff;
+  display: flex; gap: 10px; align-items: flex-start;
+}
+.wb-goal .wb-goal-ico { font-size: 15px; }
+.wb-goal-text { flex: 1; min-width: 0; font-size: 12.5px; line-height: 1.6; color: #1e3a8a; }
+.wb-goal .wb-muted { font-size: 11px; }
+.wb-columns { display: flex; gap: 10px; padding: 10px 12px; flex: none; }
+.wb-col { flex: 1; min-width: 0; background: var(--wb-bg-soft); border: 1px solid var(--wb-line); border-radius: 9px; display: flex; flex-direction: column; max-height: 46vh; }
+.wb-col h4 {
+  margin: 0; padding: 8px 10px; font-size: 11.5px; letter-spacing: .3px; color: var(--wb-text-soft);
+  border-bottom: 1px solid var(--wb-line); display: flex; align-items: center; gap: 6px; font-weight: 700;
+}
+.wb-col[data-status="in_progress"] h4 { color: var(--wb-blue); }
+.wb-col[data-status="completed"] h4 { color: var(--wb-green); }
+.wb-cards { padding: 8px; display: flex; flex-direction: column; gap: 6px; overflow: auto; }
+.wb-card {
+  background: #fff; border: 1px solid var(--wb-line); border-left: 3px solid var(--wb-line-strong);
+  border-radius: 7px; padding: 7px 9px; font-size: 12px; line-height: 1.5; color: var(--wb-text);
+  box-shadow: 0 1px 2px rgba(15,23,42,.04);
+}
+.wb-col[data-status="pending"] .wb-card { border-left-color: #c3cedf; }
+.wb-col[data-status="in_progress"] .wb-card { border-left-color: var(--wb-blue); }
+.wb-col[data-status="completed"] .wb-card { border-left-color: var(--wb-green); color: var(--wb-text-soft); }
+.wb-card.wb-done { text-decoration: line-through; text-decoration-color: #b9c6d8; }
+.wb-feed { flex: 1; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--wb-line); }
+.wb-feed h4 { margin: 0; padding: 8px 12px; font-size: 11.5px; color: var(--wb-text-soft); display: flex; gap: 8px; align-items: center; }
+.wb-events { flex: 1; min-height: 0; overflow: auto; padding: 0 12px 12px; }
+.wb-ev { display: flex; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 11.5px; align-items: baseline; }
+.wb-ev:hover { background: var(--wb-bg-soft); }
+.wb-ev .wb-ev-t { flex: none; width: 52px; color: var(--wb-text-faint); font: 10.5px var(--wb-mono); }
+.wb-ev .wb-ev-k { flex: none; width: 74px; font-weight: 700; color: var(--wb-text-soft); font-size: 11px; }
+.wb-ev .wb-ev-x { flex: 1; min-width: 0; font-family: var(--wb-mono); font-size: 11px; color: #334155; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-ev.wb-ev-tool .wb-ev-k { color: var(--wb-blue); }
+.wb-ev.wb-ev-user .wb-ev-k { color: #7c3aed; }
+.wb-ev.wb-ev-err .wb-ev-k { color: var(--wb-red); }
+.wb-ev.wb-ev-turn .wb-ev-k { color: var(--wb-amber); }
+
+/* 变更 / diff */
+.wb-list { flex: 1; min-height: 0; overflow: auto; padding: 6px; }
+.wb-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px;
+  cursor: pointer; font-size: 12px;
+}
+.wb-item:hover { background: #e9eff9; }
+.wb-item.wb-on { background: var(--wb-blue-soft); }
+.wb-item .wb-st { flex: none; width: 16px; text-align: center; font: 700 11px var(--wb-mono); }
+.wb-item[data-status="modified"] .wb-st { color: var(--wb-amber); }
+.wb-item[data-status="added"] .wb-st { color: var(--wb-green); }
+.wb-item[data-status="deleted"] .wb-st { color: var(--wb-red); }
+.wb-item .wb-p { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--wb-mono); font-size: 11.5px; }
+.wb-item .wb-stat { flex: none; font: 10.5px var(--wb-mono); color: var(--wb-text-faint); }
+.wb-item .wb-stat .wb-a { color: var(--wb-green); }
+.wb-item .wb-stat .wb-d { color: var(--wb-red); }
+.wb-diff-body { flex: 1; min-height: 0; overflow: auto; background: #fff; }
+.wb-diff { display: block; font: 12px/1.5 var(--wb-mono); white-space: pre; padding: 6px 0; }
+.wb-diff .wb-dr { display: flex; }
+.wb-diff .wb-dr.wb-del { background: #fff1f2; }
+.wb-diff .wb-dr.wb-ins { background: #ecfdf5; }
+.wb-diff .wb-dr.wb-hunk { background: #f1f5fb; color: var(--wb-text-faint); }
+.wb-diff .wb-dr .wb-ln { flex: none; width: 46px; text-align: right; padding-right: 8px; color: #b3bfd1; font-size: 11px; user-select: none; }
+.wb-diff .wb-dr .wb-sg { flex: none; width: 14px; color: #94a3b8; user-select: none; }
+.wb-diff .wb-dr.wb-del .wb-sg { color: var(--wb-red); }
+.wb-diff .wb-dr.wb-ins .wb-sg { color: var(--wb-green); }
+.wb-diff .wb-dr .wb-src { padding-right: 14px; white-space: pre; }
+
+/* 编辑遮罩 */
+.wb-editor { position: fixed; inset: 0; z-index: 5; display: none; background: rgba(15,23,42,.35); }
+.wb-editor.wb-on { display: flex; align-items: center; justify-content: center; }
+.wb-editor-card {
+  width: min(760px, 92vw); height: min(76vh, 720px); background: #fff; border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(15,23,42,.3); display: flex; flex-direction: column; overflow: hidden;
+}
+.wb-editor-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--wb-line); }
+.wb-editor-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.wb-editor textarea {
+  flex: 1; min-height: 0; border: none; outline: none; resize: none; padding: 12px;
+  font: 12px/1.55 var(--wb-mono); color: #1f2a37; background: #fbfdff; tab-size: 4; white-space: pre;
+}
+.wb-editor-diff { flex: 1; min-height: 0; overflow: auto; display: none; }
+.wb-editor.wb-preview .wb-editor textarea { display: none; }
+.wb-editor.wb-preview .wb-editor-diff { display: block; }
+
+/* 底部状态栏 */
+.wb-foot {
+  flex: none; display: flex; align-items: center; gap: 10px; padding: 6px 12px;
+  border-top: 1px solid var(--wb-line); background: var(--wb-bg-soft);
+  color: var(--wb-text-faint); font-size: 11px;
+}
+.wb-dot { width: 7px; height: 7px; border-radius: 50%; background: #c3cedf; display: inline-block; }
+.wb-dot.wb-run { background: var(--wb-green); box-shadow: 0 0 0 3px rgba(20,160,90,.15); }
+.wb-dot.wb-busy { background: var(--wb-amber); box-shadow: 0 0 0 3px rgba(217,119,6,.15); }
+
+/* 提示 */
+.wb-toast-wrap { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; align-items: center; pointer-events: none; }
+.wb-toast {
+  background: #111827; color: #f8fafc; padding: 8px 14px; border-radius: 999px; font-size: 12px;
+  box-shadow: 0 10px 24px rgba(15,23,42,.28); opacity: 0; transform: translateY(6px);
+  transition: opacity .18s ease, transform .18s ease; max-width: 70vw; text-align: center;
+}
+.wb-toast.wb-on { opacity: 1; transform: translateY(0); }
+.wb-toast.wb-err { background: #7f1d1d; }
+.wb-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.wb-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
+.wb-scroll::-webkit-scrollbar-thumb:hover { background: #94a3b8; background-clip: content-box; }
+</style>
+<!--@/STYLE@-->
+<!--@MARKUP@-->
+<div class="wb-app wb-scroll" id="wb-root">
+  <div class="wb-scrim" data-close="1"></div>
+  <aside class="wb-drawer">
+    <div class="wb-head">
+      <div class="wb-head-top">
+        <div class="wb-logo"></div>
+        <div class="wb-title">DSH 工作台</div>
+        <span class="wb-ver" id="wb-ver">v3.5.0</span>
+        <div class="wb-spacer"></div>
+        <div class="wb-ws" id="wb-ws" title="点击切换工作区目录">
+          <span>📁</span><span class="wb-ws-path" id="wb-ws-path">…</span>
+        </div>
+        <button class="wb-icon-btn" data-close="1" title="关闭（Esc）">✕</button>
+      </div>
+      <div class="wb-tabs" id="wb-tabs">
+        <button class="wb-tab wb-on" data-tab="files">文件</button>
+        <button class="wb-tab" data-tab="term">终端</button>
+        <button class="wb-tab" data-tab="tasks">任务<span class="wb-badge" id="wb-badge-tasks" style="display:none"></span></button>
+        <button class="wb-tab" data-tab="diff">变更<span class="wb-badge" id="wb-badge-diff" style="display:none"></span></button>
+        <button class="wb-tab" data-tab="git">Git</button>
+      </div>
+    </div>
+
+    <div class="wb-body">
+      <!-- 文件 -->
+      <section class="wb-pane wb-on" data-pane="files">
+        <div class="wb-split">
+          <div class="wb-col-side">
+            <input class="wb-search" id="wb-file-search" placeholder="搜索文件名…（回车=按内容搜索）">
+            <div class="wb-tree wb-scroll" id="wb-tree"></div>
+          </div>
+          <div class="wb-col-main">
+            <div class="wb-view-head">
+              <span class="wb-file-path" id="wb-file-path">从左侧选择文件</span>
+              <div class="wb-grow"></div>
+              <button class="wb-btn wb-ghost" data-fs="copy">复制路径</button>
+              <button class="wb-btn wb-ghost" data-fs="at">@ 引用</button>
+              <button class="wb-btn wb-ghost" data-fs="reveal">定位</button>
+              <button class="wb-btn wb-ghost" data-fs="edit">编辑</button>
+            </div>
+            <div class="wb-view-body wb-scroll" id="wb-file-view">
+              <div class="wb-empty">选择文件后可预览内容；点「@ 引用」把路径插入 DSH 输入框</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 终端 -->
+      <section class="wb-pane" data-pane="term">
+        <div class="wb-term">
+          <div class="wb-term-bar">
+            <select id="wb-shell"></select>
+            <span class="wb-cwd" id="wb-cwd">.</span>
+            <div class="wb-grow"></div>
+            <span class="wb-policy" id="wb-policy">待输入</span>
+            <button class="wb-btn wb-ghost" id="wb-term-clear">清屏</button>
+            <button class="wb-btn wb-ghost" id="wb-term-stop">停止</button>
+          </div>
+          <div class="wb-term-out wb-scroll" id="wb-term-out"></div>
+          <div class="wb-confirm" id="wb-confirm">
+            <span class="wb-grow" id="wb-confirm-text"></span>
+            <button class="wb-btn wb-primary" id="wb-confirm-yes">确认执行</button>
+            <button class="wb-btn wb-ghost" id="wb-confirm-no">取消</button>
+          </div>
+          <div class="wb-term-input">
+            <span class="wb-prompt">&gt;</span>
+            <input class="wb-cmd" id="wb-cmd" placeholder="输入命令，Enter 执行（↑↓ 翻历史）" autocomplete="off" spellcheck="false">
+            <button class="wb-btn wb-primary" id="wb-run">运行</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 任务 -->
+      <section class="wb-pane" data-pane="tasks">
+        <div class="wb-tasks">
+          <div class="wb-goal" id="wb-goal">
+            <span class="wb-goal-ico">🎯</span>
+            <div class="wb-goal-text" id="wb-goal-text">还没有读到 Agent 的目标。派一个任务给 DSH，这里会自动出现目标与任务卡。</div>
+            <div class="wb-muted" id="wb-goal-meta"></div>
+          </div>
+          <div class="wb-columns">
+            <div class="wb-col" data-status="pending"><h4>待规划 <span class="wb-badge" data-count="pending">0</span></h4><div class="wb-cards wb-scroll" data-cards="pending"></div></div>
+            <div class="wb-col" data-status="in_progress"><h4>进行中 <span class="wb-badge" data-count="in_progress">0</span></h4><div class="wb-cards wb-scroll" data-cards="in_progress"></div></div>
+            <div class="wb-col" data-status="completed"><h4>已完成 <span class="wb-badge" data-count="completed">0</span></h4><div class="wb-cards wb-scroll" data-cards="completed"></div></div>
+          </div>
+          <div class="wb-feed">
+            <h4>会话活动 <span class="wb-muted" id="wb-feed-meta"></span></h4>
+            <div class="wb-events wb-scroll" id="wb-events"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 变更 -->
+      <section class="wb-pane" data-pane="diff">
+        <div class="wb-toolbar">
+          <span class="wb-muted" id="wb-ch-summary">…</span>
+          <div class="wb-grow"></div>
+          <button class="wb-btn wb-ghost" data-ch="refresh">刷新</button>
+          <button class="wb-btn wb-ghost" data-ch="snapshot">重设基线</button>
+          <button class="wb-btn" data-ch="accept-all">全部接受</button>
+        </div>
+        <div class="wb-split">
+          <div class="wb-col-side">
+            <div class="wb-list wb-scroll" id="wb-ch-list"></div>
+          </div>
+          <div class="wb-col-main">
+            <div class="wb-diff-head">
+              <span class="wb-file-path" id="wb-diff-path">选择变更文件</span>
+              <div class="wb-grow"></div>
+              <button class="wb-btn wb-ghost" data-ch="accept">接受</button>
+              <button class="wb-btn wb-ghost" data-ch="revert">回滚</button>
+              <button class="wb-btn wb-ghost" data-ch="edit">编辑</button>
+            </div>
+            <div class="wb-diff-body wb-scroll" id="wb-diff-body">
+              <div class="wb-empty">基线快照记录「我上次认可的状态」；Agent 改了文件，这里就会出现行级 diff，<br>确认无误点「接受」，不满意点「回滚」恢复成基线内容。</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Git -->
+      <section class="wb-pane" data-pane="git">
+        <div class="wb-toolbar">
+          <span class="wb-mono" id="wb-git-branch">…</span>
+          <span class="wb-muted" id="wb-git-head"></span>
+          <div class="wb-grow"></div>
+          <button class="wb-btn wb-ghost" data-git="refresh">刷新</button>
+        </div>
+        <div class="wb-split">
+          <div class="wb-col-side">
+            <div class="wb-list wb-scroll" id="wb-git-list"></div>
+          </div>
+          <div class="wb-col-main">
+            <div class="wb-git-detail-head">
+              <span class="wb-file-path" id="wb-git-path">未提交变更 / 最近提交</span>
+              <div class="wb-grow"></div>
+              <button class="wb-btn wb-ghost" data-git="copy">复制命令</button>
+            </div>
+            <div class="wb-diff-body wb-scroll" id="wb-git-body">
+              <div class="wb-empty">左侧列出未提交变更与最近提交；点条目查看 diff / 详情。</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="wb-foot">
+      <span class="wb-dot" id="wb-dot"></span>
+      <span id="wb-foot-state">正在连接面板…</span>
+      <div class="wb-grow" style="flex:1"></div>
+      <span id="wb-foot-right"></span>
+    </div>
+  </aside>
+
+  <button class="wb-launcher" id="wb-launcher" title="打开工作台（F2）">
+    <span>🧰</span><span>工作台</span><span class="wb-kbd">F2</span>
+  </button>
+
+  <div class="wb-editor" id="wb-editor">
+    <div class="wb-editor-card">
+      <div class="wb-editor-head">
+        <span class="wb-file-path" id="wb-editor-path">编辑</span>
+        <div class="wb-grow"></div>
+        <button class="wb-btn wb-ghost" id="wb-editor-toggle">预览差异</button>
+        <button class="wb-btn wb-primary" id="wb-editor-apply">应用</button>
+        <button class="wb-btn wb-ghost" id="wb-editor-close">关闭</button>
+      </div>
+      <div class="wb-editor-body">
+        <textarea id="wb-editor-text" spellcheck="false"></textarea>
+        <div class="wb-editor-diff wb-scroll" id="wb-editor-diff"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="wb-toast-wrap" id="wb-toast-wrap"></div>
+</div>
+<!--@/MARKUP@-->
+<!--@SCRIPT@-->
+(function () {
+  'use strict';
+
+  var HOST_ID = 'dsh-workbench-host';
+  var api = function () { return (window.chrome && window.chrome.webview) ? window.chrome.webview : null; };
+  var seq = 0;
+  var pending = {};
+  var S = {
+    open: false,
+    tab: 'files',
+    ws: '',
+    shells: [],
+    file: null,
+    fileText: '',
+    expanded: {},
+    dirCache: {},
+    agent: { state: 'unknown', title: '', goal: null, todos: null, events: [], sessionId: '' },
+    changes: null,
+    changesSel: null,
+    git: null,
+    gitSel: null,
+    term: { runId: null, busy: false, cwd: '.', hist: [], idx: -1, pendingCmd: null },
+    editor: { path: null, text: '', previewing: false },
+    poll: null
+  };
+  var ui = {};
+
+  // ---------------------------------------------------------------- 桥接
+  function call(op, args) {
+    return new Promise(function (resolve, reject) {
+      var wv = api();
+      if (!wv) { reject(new Error('工作台桥接不可用（不在面板内运行）')); return; }
+      var id = 'c' + (++seq);
+      var msg = { op: op, id: id };
+      // 参数不允许覆盖信封字段（op / id）：以前 term.kill 传 { id: runId } 会把请求 id 顶掉，
+      // 响应就配不上对，界面表现为「点了没反应」。
+      if (args) {
+        for (var k in args) {
+          if (!Object.prototype.hasOwnProperty.call(args, k)) { continue; }
+          if (k === 'id' || k === 'op') { continue; }
+          msg[k] = args[k];
+        }
+      }
+      pending[id] = { resolve: resolve, reject: reject };
+      wv.postMessage(JSON.stringify(msg));
+    });
+  }
+
+  function onMessage(e) {
+    var m = e.data;
+    if (!m || typeof m !== 'object') { return; }
+    if (m.push) { onPush(m); return; }
+    if (m.id && pending[m.id]) {
+      var p = pending[m.id];
+      delete pending[m.id];
+      if (m.ok) { p.resolve(m.data || {}); } else { p.reject(new Error(m.error || '操作失败')); }
+    }
+  }
+
+  function onPush(m) {
+    if (m.push === 'term') { termWrite(m.out || '', null); termWrite(m.err || '', 'wb-err'); return; }
+    if (m.push === 'term-exit') {
+      S.term.busy = false;
+      if (m.cwd) { S.term.cwd = m.cwd; ui.cwd.textContent = shortCwd(m.cwd); }
+      var okExit = m.code === 0;
+      termWrite('[退出码 ' + m.code + ' · ' + (m.ms / 1000).toFixed(2) + 's]\n', okExit ? 'wb-ok' : 'wb-err');
+      return;
+    }
+    if (m.push === 'agent-snapshot' || m.push === 'agent-state') {
+      S.agent = m;
+      renderTasks();
+      updateFoot();
+      return;
+    }
+    if (m.push === 'agent-ev') {
+      var ev = m.ev;
+      if (ev) {
+        if (ev.kind === 'todos') { S.agent.todos = ev.todos; }
+        if (ev.kind === 'goal') { S.agent.goal = { objective: ev.objective, phase: ev.phase }; }
+        if (ev.kind === 'title') { S.agent.title = ev.title; }
+        if (ev.kind === 'turn') { S.agent.state = ev.state; }
+        S.agent.events = (S.agent.events || []).concat([ev]);
+        if (S.agent.events.length > 400) { S.agent.events.shift(); }
+      }
+      renderTasks();
+      updateFoot();
+      return;
+    }
+    if (m.push === 'agent-reset') {
+      S.agent = { state: 'idle', title: '', goal: null, todos: null, events: [], sessionId: m.sessionId || '' };
+      renderTasks();
+      updateFoot();
+      return;
+    }
+    if (m.push === 'agent-idle') { S.agent.state = 'idle'; renderTasks(); updateFoot(); return; }
+    if (m.push === 'agent-note') { termWrite('[工作台] ' + (m.text || '') + '\n', 'wb-sys'); return; }
+  }
+
+  // ---------------------------------------------------------------- 小工具
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    if (text !== undefined && text !== null) { n.textContent = text; }
+    return n;
+  }
+
+  function hhmmss(ms) {
+    if (!ms) { return '--:--:--'; }
+    var d = new Date(ms);
+    var p = function (v) { return (v < 10 ? '0' : '') + v; };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  function relTime(ms) {
+    if (!ms) { return ''; }
+    var s = Math.floor((Date.now() - ms) / 1000);
+    if (s < 0) { return '刚刚'; }
+    if (s < 60) { return s + 's 前'; }
+    if (s < 3600) { return Math.floor(s / 60) + 'm 前'; }
+    if (s < 86400) { return Math.floor(s / 3600) + 'h 前'; }
+    return Math.floor(s / 86400) + 'd 前';
+  }
+
+  function fmtSize(n) {
+    if (n === undefined || n === null || n < 0) { return ''; }
+    if (n < 1024) { return n + ' B'; }
+    if (n < 1024 * 1024) { return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB'; }
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  function shortCwd(p) {
+    if (!p) { return '.'; }
+    if (p.length <= 46) { return p; }
+    return '…' + p.slice(p.length - 44);
+  }
+
+  function toast(text, isErr) {
+    var t = el('div', 'wb-toast' + (isErr ? ' wb-err' : ''), text);
+    ui.toastWrap.appendChild(t);
+    setTimeout(function () { t.classList.add('wb-on'); }, 10);
+    setTimeout(function () {
+      t.classList.remove('wb-on');
+      setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 220);
+    }, isErr ? 3600 : 1900);
+  }
+
+  function copyText(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  // 把 "@path " 插进 DSH 的输入框：优先原生 setter（React 受控）+ input 事件，
+  // 编辑器用的是 contenteditable 时走 execCommand('insertText')。
+  function insertIntoComposer(text) {
+    var cands = document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]');
+    for (var i = 0; i < cands.length; i++) {
+      var n = cands[i];
+      try {
+        if (n.tagName === 'TEXTAREA' || n.tagName === 'INPUT') {
+          n.focus();
+          var proto = n.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+          var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+          var before = n.value;
+          if (desc && desc.set) { desc.set.call(n, before + text); } else { n.value = before + text; }
+          n.dispatchEvent(new Event('input', { bubbles: true }));
+          n.setSelectionRange(n.value.length, n.value.length);
+          if (n.value !== before) { return true; }
+        } else if (n.isContentEditable) {
+          n.focus();
+          var beforeHtml = n.textContent;
+          document.execCommand('insertText', false, text);
+          if (n.textContent !== beforeHtml) { return true; }
+        }
+      } catch (e) { /* 下一个候选 */ }
+    }
+    return false;
+  }
+
+  // ---------------------------------------------------------------- 打开 / 关闭
+  function setOpen(v) {
+    S.open = v;
+    if (v) { ui.root.classList.add('wb-open'); } else { ui.root.classList.remove('wb-open'); }
+    if (v) { ensureHello(); }
+  }
+
+  function toggle() {
+    setOpen(!S.open);
+    if (S.open) { setTab(S.tab); }
+  }
+
+  function openTab(tab) {
+    setOpen(true);
+    setTab(tab || 'files');
+  }
+
+  var helloDone = false;
+  function ensureHello() {
+    if (helloDone) { return; }
+    helloDone = true;
+    call('hello').then(function (d) {
+      S.ws = d.workspace || '';
+      S.shells = d.shells || [];
+      ui.wsPath.textContent = S.ws;
+      ui.ver.textContent = 'v' + (d.version || '');
+      if (d.agent) { S.agent = d.agent; renderTasks(); }
+      fillShells();
+      updateFoot();
+      if (S.tab === 'files' && !S.file) { loadRoot(); }
+    }).catch(function (err) {
+      helloDone = false;
+      termWrite('[工作台] 连接面板失败：' + err.message + '\n', 'wb-err');
+      updateFoot();
+    });
+  }
+
+  function setTab(tab) {
+    S.tab = tab;
+    var tabs = ui.tabs.querySelectorAll('.wb-tab');
+    for (var i = 0; i < tabs.length; i++) { tabs[i].classList.toggle('wb-on', tabs[i].getAttribute('data-tab') === tab); }
+    var panes = ui.panes;
+    for (var j = 0; j < panes.length; j++) { panes[j].classList.toggle('wb-on', panes[j].getAttribute('data-pane') === tab); }
+    ensureHello();
+    if (tab === 'files') { if (!S.file) { loadRoot(); } }
+    else if (tab === 'tasks') { refreshAgent(); }
+    else if (tab === 'diff') { loadChanges(); startPoll(); }
+    else if (tab === 'git') { loadGit(); }
+    if (tab !== 'diff') { stopPoll(); }
+    if (tab === 'term') { setTimeout(function () { ui.cmd.focus(); }, 60); }
+  }
+
+  // ---------------------------------------------------------------- 文件
+  function loadRoot() {
+    ui.tree.innerHTML = '';
+    S.dirCache = {};
+    listDir('.', ui.tree, 0);
+  }
+
+  function listDir(rel, container, depth) {
+    call('fs.list', { path: rel }).then(function (d) {
+      container.innerHTML = '';
+      var items = d.items || [];
+      if (items.length === 0) { container.appendChild(el('div', 'wb-muted', '（空目录）')); return; }
+      for (var i = 0; i < items.length; i++) { container.appendChild(makeRow(items[i], depth)); }
+    }).catch(function (err) { container.appendChild(el('div', 'wb-muted', err.message)); });
+  }
+
+  function makeRow(it, depth) {
+    var row = el('div', 'wb-row');
+    row.setAttribute('data-path', it.path);
+    var arrow = el('span', 'wb-arrow', it.dir ? '▶' : '');
+    row.appendChild(arrow);
+    row.appendChild(el('span', 'wb-ico', it.dir ? '📁' : iconFor(it.ext)));
+    row.appendChild(el('span', 'wb-name', it.name));
+    if (!it.dir && it.size !== undefined) { row.appendChild(el('span', 'wb-meta', fmtSize(it.size))); }
+    if (it.dir) {
+      var kids = el('div', 'wb-children');
+      kids.style.display = 'none';
+      var holder = el('div');
+      holder.appendChild(row);
+      holder.appendChild(kids);
+      row.addEventListener('click', function () {
+        var on = kids.style.display !== 'none';
+        if (on) { kids.style.display = 'none'; arrow.textContent = '▶'; return; }
+        kids.style.display = 'block';
+        arrow.textContent = '▼';
+        if (!kids.getAttribute('data-loaded')) {
+          kids.setAttribute('data-loaded', '1');
+          listDir(it.path, kids, depth + 1);
+        }
+      });
+      return holder;
+    }
+    row.addEventListener('click', function () {
+      var prev = ui.tree.querySelector('.wb-row.wb-on');
+      if (prev) { prev.classList.remove('wb-on'); }
+      row.classList.add('wb-on');
+      openFile(it.path);
+    });
+    return row;
+  }
+
+  function iconFor(ext) {
+    var map = { js: '🟨', mjs: '🟨', cjs: '🟨', ts: '🟦', cs: '🟪', ps1: '🔷', cmd: '⬛', bat: '⬛', html: '🟧', css: '🟦', md: '📘', json: '🧾', yaml: '🧾', yml: '🧾', txt: '📄', png: '🖼', jpg: '🖼', gif: '🖼', svg: '🖼', exe: '⚙', dll: '⚙', log: '📜', config: '🧾' };
+    return map[ext] || '📄';
+  }
+
+  function openFile(path) {
+    S.file = path;
+    ui.filePath.textContent = path;
+    ui.fileView.innerHTML = '';
+    ui.fileView.appendChild(el('div', 'wb-empty', '读取中…'));
+    call('fs.read', { path: path }).then(function (d) {
+      ui.fileView.innerHTML = '';
+      if (d.kind === 'text') {
+        S.fileText = d.text || '';
+        ui.fileView.appendChild(renderCode(S.fileText));
+        ui.filePath.textContent = path + '   ' + fmtSize(d.size) + '   ' + d.text.split('\n').length + ' 行';
+      } else if (d.kind === 'image') {
+        var img = el('img', 'wb-img');
+        img.src = d.dataUrl;
+        ui.fileView.appendChild(img);
+      } else {
+        ui.fileView.appendChild(el('div', 'wb-empty', d.error || '该文件不支持预览'));
+      }
+    }).catch(function (err) {
+      ui.fileView.innerHTML = '';
+      ui.fileView.appendChild(el('div', 'wb-empty', err.message));
+    });
+  }
+
+  function renderCode(text) {
+    var box = el('div', 'wb-code');
+    var lines = String(text).split('\n');
+    var cap = Math.min(lines.length, 6000);
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < cap; i++) {
+      var row = el('div', 'wb-line');
+      row.appendChild(el('span', 'wb-ln', String(i + 1)));
+      var src = el('span', 'wb-src');
+      src.textContent = lines[i].length ? lines[i] : ' ';
+      row.appendChild(src);
+      frag.appendChild(row);
+    }
+    if (lines.length > cap) { frag.appendChild(el('div', 'wb-line', '… 后 ' + (lines.length - cap) + ' 行未显示')); }
+    box.appendChild(frag);
+    return box;
+  }
+
+  function searchFiles(mode) {
+    var q = ui.fileSearch.value.trim();
+    if (!q) { loadRoot(); return; }
+    call('fs.search', { query: q, mode: mode }).then(function (d) {
+      ui.tree.innerHTML = '';
+      var hits = d.hits || [];
+      if (hits.length === 0) { ui.tree.appendChild(el('div', 'wb-muted', '没有匹配')); return; }
+      for (var i = 0; i < hits.length; i++) {
+        var h = hits[i];
+        var row = el('div', 'wb-row');
+        row.appendChild(el('span', 'wb-arrow', h.line ? '↳' : ''));
+        row.appendChild(el('span', 'wb-ico', h.line ? '🔎' : iconFor((h.path.split('.').pop() || '').toLowerCase())));
+        var name = h.line ? h.path.split('/').pop() + ':' + h.line : h.path;
+        row.appendChild(el('span', 'wb-name', name));
+        if (h.text) { row.appendChild(el('span', 'wb-meta', h.text.slice(0, 40))); }
+        (function (path) {
+          row.addEventListener('click', function () { openFile(path); });
+        })(h.path);
+        ui.tree.appendChild(row);
+      }
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  // ---------------------------------------------------------------- 终端
+  function fillShells() {
+    ui.shell.innerHTML = '';
+    var list = S.shells && S.shells.length ? S.shells : [{ id: 'powershell', label: 'PowerShell' }];
+    for (var i = 0; i < list.length; i++) {
+      var o = el('option', null, list[i].label);
+      o.value = list[i].id;
+      if (list[i].id === 'pwsh') { o.value = 'pwsh'; }
+      ui.shell.appendChild(o);
+    }
+  }
+
+  function termWrite(text, cls) {
+    if (!text) { return; }
+    var out = ui.termOut;
+    var pinned = out.scrollHeight - out.scrollTop - out.clientHeight < 60;
+    var span = el('span', cls || null, text);
+    out.appendChild(span);
+    if (out.textContent.length > 400000) {
+      out.textContent = '[工作台] 界面输出过多，已清空较早内容\n' + out.textContent.slice(-120000);
+    }
+    if (pinned) { out.scrollTop = out.scrollHeight; }
+  }
+
+  function policyBadge(level, reason) {
+    var p = ui.policy;
+    p.className = 'wb-policy' + (level === 'allow' ? ' wb-allow' : level === 'danger' ? ' wb-danger' : level === 'ask' ? ' wb-ask' : '');
+    p.textContent = level === 'allow' ? '白名单' : level === 'danger' ? '危险' : level === 'ask' ? '需确认' : '待输入';
+    p.title = reason || '';
+  }
+
+  var policyTimer = null;
+  function checkPolicy() {
+    var cmd = ui.cmd.value.trim();
+    if (!cmd) { policyBadge('', ''); return; }
+    if (policyTimer) { clearTimeout(policyTimer); }
+    policyTimer = setTimeout(function () {
+      call('term.policy', { shell: ui.shell.value, command: cmd }).then(function (d) {
+        policyBadge(d.level, d.reason);
+      }).catch(function () { });
+    }, 220);
+  }
+
+  function showConfirm(level, reason, cmd) {
+    S.term.pendingCmd = cmd;
+    ui.confirm.className = 'wb-confirm wb-on' + (level === 'danger' ? '' : ' wb-ask');
+    ui.confirmText.textContent = (level === 'danger' ? '⚠ 危险命令：' : '需要确认：') + (reason || '') + ' —— ' + cmd;
+    ui.confirmYes.textContent = level === 'danger' ? '我已确认，执行' : '确认执行';
+  }
+
+  function hideConfirm() {
+    S.term.pendingCmd = null;
+    ui.confirm.className = 'wb-confirm';
+  }
+
+  function runCommand(force, cmdOverride) {
+    var cmd = cmdOverride !== undefined ? cmdOverride : ui.cmd.value.trim();
+    if (!cmd) { return; }
+    if (S.term.busy) { toast('上一条命令还在跑，先停止或等它结束', true); return; }
+    S.term.busy = true;
+    if (cmdOverride === undefined) {
+      S.term.hist.push(cmd);
+      if (S.term.hist.length > 200) { S.term.hist.shift(); }
+      S.term.idx = -1;
+      ui.cmd.value = '';
+      policyBadge('', '');
+      termWrite('> ' + cmd + '\n', 'wb-cmd-echo');
+    }
+    call('term.run', { shell: ui.shell.value, command: cmd, cwd: S.term.cwd, force: !!force }).then(function (d) {
+      if (d.needConfirm) {
+        S.term.busy = false;
+        showConfirm(d.level, d.reason, cmd);
+        return;
+      }
+      S.term.runId = d.id;
+      ui.footRight.textContent = '终端：运行中';
+    }).catch(function (err) {
+      S.term.busy = false;
+      termWrite('[工作台] ' + err.message + '\n', 'wb-err');
+    });
+  }
+
+  // ---------------------------------------------------------------- 任务看板
+  function refreshAgent() {
+    call('agent.state').then(function (d) {
+      S.agent = d;
+      renderTasks();
+      updateFoot();
+    }).catch(function () { });
+  }
+
+  function renderTasks() {
+    var a = S.agent || {};
+    var goal = a.goal && a.goal.objective ? a.goal.objective : '';
+    var title = a.title || '';
+    if (goal) {
+      ui.goalText.textContent = goal;
+      ui.goalMeta.textContent = a.state === 'running' ? 'Agent 正在执行…' : (a.state === 'idle' ? '空闲' : '');
+    } else if (title) {
+      ui.goalText.textContent = title;
+      ui.goalMeta.textContent = '会话标题（还没读到明确目标）';
+    } else {
+      ui.goalText.textContent = '还没有读到 Agent 的目标。派一个任务给 DSH，这里会自动出现目标与任务卡。';
+      ui.goalMeta.textContent = a.note || '';
+    }
+    var todos = a.todos || [];
+    var byStatus = { pending: [], in_progress: [], completed: [] };
+    for (var i = 0; i < todos.length; i++) {
+      var st = todos[i].status || 'pending';
+      if (!byStatus[st]) { byStatus[st] = []; }
+      byStatus[st].push(todos[i]);
+    }
+    var cols = ['pending', 'in_progress', 'completed'];
+    for (var c = 0; c < cols.length; c++) {
+      var key = cols[c];
+      var box = ui.root.querySelector('[data-cards="' + key + '"]');
+      if (!box) { continue; }
+      box.innerHTML = '';
+      var list = byStatus[key] || [];
+      if (list.length === 0) { box.appendChild(el('div', 'wb-muted', '（空）')); }
+      for (var k = 0; k < list.length; k++) {
+        var card = el('div', 'wb-card' + (key === 'completed' ? ' wb-done' : ''), list[k].content || '');
+        box.appendChild(card);
+      }
+      var badge = ui.root.querySelector('[data-count="' + key + '"]');
+      if (badge) { badge.textContent = String(list.length); }
+    }
+    var badgeTasks = document.getElementById('wb-badge-tasks');
+    if (badgeTasks) {
+      if (todos.length > 0) { badgeTasks.style.display = ''; badgeTasks.textContent = String(todos.length); badgeTasks.className = 'wb-badge wb-badge-hot'; }
+      else { badgeTasks.style.display = 'none'; }
+    }
+    renderEvents();
+  }
+
+  function renderEvents() {
+    var evs = (S.agent && S.agent.events) || [];
+    var box = ui.events;
+    box.innerHTML = '';
+    if (evs.length === 0) {
+      box.appendChild(el('div', 'wb-muted', '暂无活动。Agent 开始干活后，这里会实时显示它在读什么、跑什么命令、改了什么。'));
+      return;
+    }
+    var shown = evs.slice(Math.max(0, evs.length - 80)).reverse();
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < shown.length; i++) {
+      var ev = shown[i];
+      var row = el('div', 'wb-ev');
+      row.appendChild(el('span', 'wb-ev-t', hhmmss(ev.time)));
+      var kind = '活动';
+      var text = '';
+      if (ev.kind === 'tool-call') {
+        kind = ev.name || 'tool';
+        text = ev.summary || '';
+        row.className += ' wb-ev-tool';
+      } else if (ev.kind === 'tool-result') {
+        kind = ev.ok ? '完成' : '出错';
+        text = ev.text || '';
+        if (!ev.ok) { row.className += ' wb-ev-err'; }
+      } else if (ev.kind === 'user') {
+        kind = '用户';
+        text = ev.text || '';
+        row.className += ' wb-ev-user';
+      } else if (ev.kind === 'turn') {
+        kind = ev.state === 'running' ? '开始' : '结束';
+        text = ev.reason ? ('本轮 ' + ev.state + '（' + ev.reason + '）') : ('本轮 ' + ev.state);
+        row.className += ' wb-ev-turn';
+      } else if (ev.kind === 'todos') {
+        kind = '清单';
+        text = '更新了任务清单（' + ((ev.todos || []).length) + ' 项）';
+      } else if (ev.kind === 'goal') {
+        kind = '目标';
+        text = ev.objective || '';
+      } else if (ev.kind === 'title') {
+        kind = '标题';
+        text = ev.title || '';
+      }
+      row.appendChild(el('span', 'wb-ev-k', kind));
+      row.appendChild(el('span', 'wb-ev-x', text));
+      frag.appendChild(row);
+    }
+    box.appendChild(frag);
+    ui.feedMeta.textContent = '共 ' + evs.length + ' 条 · ' + (S.agent.title || '');
+  }
+
+  // ---------------------------------------------------------------- 变更
+  function loadChanges(silent) {
+    return call('changes.list').then(function (d) {
+      S.changes = d;
+      renderChanges(!silent);
+    }).catch(function (err) { if (!silent) { toast(err.message, true); } });
+  }
+
+  function renderChanges(rerenderDetail) {
+    var d = S.changes || {};
+    var items = d.items || [];
+    ui.chSummary.textContent = '基线 ' + (d.baselineAt ? hhmmss(d.baselineAt) : '未建立') +
+      ' · 修改 ' + (d.modified || 0) + ' · 新增 ' + (d.added || 0) + ' · 删除 ' + (d.deleted || 0) +
+      '（扫描 ' + (d.files || 0) + ' 个文件）';
+    var list = ui.chList;
+    list.innerHTML = '';
+    if (items.length === 0) {
+      list.appendChild(el('div', 'wb-muted', '工作区与基线一致，没有未确认的变更。'));
+    }
+    for (var i = 0; i < items.length; i++) {
+      list.appendChild(makeChangeRow(items[i]));
+    }
+    var badge = document.getElementById('wb-badge-diff');
+    if (badge) {
+      if (items.length > 0) { badge.style.display = ''; badge.textContent = String(items.length); badge.className = 'wb-badge wb-badge-hot'; }
+      else { badge.style.display = 'none'; }
+    }
+    if (rerenderDetail && S.changesSel) { showChangeDiff(S.changesSel); }
+    if (!S.changesSel && items.length > 0) { showChangeDiff(items[0].path); }
+  }
+
+  function makeChangeRow(it) {
+    var row = el('div', 'wb-item');
+    row.setAttribute('data-status', it.status);
+    row.setAttribute('data-path', it.path);
+    if (it.path === S.changesSel) { row.classList.add('wb-on'); }
+    row.appendChild(el('span', 'wb-st', it.status === 'added' ? 'A' : it.status === 'deleted' ? 'D' : 'M'));
+    row.appendChild(el('span', 'wb-p', it.path));
+    var stat = el('span', 'wb-stat');
+    if (it.adds >= 0) {
+      stat.appendChild(el('span', 'wb-a', '+' + it.adds));
+      stat.appendChild(document.createTextNode(' '));
+      stat.appendChild(el('span', 'wb-d', '-' + it.dels));
+    } else {
+      stat.appendChild(el('span', null, '—'));
+    }
+    row.appendChild(stat);
+    row.addEventListener('click', function () { showChangeDiff(it.path); });
+    return row;
+  }
+
+  function showChangeDiff(path) {
+    S.changesSel = path;
+    var rows = ui.chList.querySelectorAll('.wb-item');
+    for (var i = 0; i < rows.length; i++) { rows[i].classList.toggle('wb-on', rows[i].getAttribute('data-path') === path); }
+    ui.diffPath.textContent = path;
+    ui.diffBody.innerHTML = '';
+    ui.diffBody.appendChild(el('div', 'wb-empty', '读取差异…'));
+    call('changes.diff', { path: path }).then(function (d) {
+      ui.diffBody.innerHTML = '';
+      if (d.error) { ui.diffBody.appendChild(el('div', 'wb-empty', d.error)); return; }
+      if (!d.rows || d.rows.length === 0) { ui.diffBody.appendChild(el('div', 'wb-empty', '没有行级差异（可能只改了时间戳/编码）')); return; }
+      ui.diffBody.appendChild(renderDiff(d.rows));
+      ui.diffPath.textContent = path + '   +' + d.adds + '  -' + d.dels + (d.truncated ? '   （差异过大，已截断）' : '');
+    }).catch(function (err) {
+      ui.diffBody.innerHTML = '';
+      ui.diffBody.appendChild(el('div', 'wb-empty', err.message));
+    });
+  }
+
+  function renderDiff(rows) {
+    var box = el('div', 'wb-diff');
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var row = el('div', 'wb-dr');
+      if (r.t === 'del') { row.className += ' wb-del'; }
+      if (r.t === 'ins') { row.className += ' wb-ins'; }
+      row.appendChild(el('span', 'wb-ln', r.o ? String(r.o) : ''));
+      row.appendChild(el('span', 'wb-ln', r.n ? String(r.n) : ''));
+      row.appendChild(el('span', 'wb-sg', r.t === 'del' ? '-' : r.t === 'ins' ? '+' : ' '));
+      var src = el('span', 'wb-src');
+      src.textContent = r.x && r.x.length ? r.x : ' ';
+      row.appendChild(src);
+      frag.appendChild(row);
+    }
+    box.appendChild(frag);
+    return box;
+  }
+
+  function changeAction(what) {
+    var path = S.changesSel;
+    if (what === 'refresh') { loadChanges(); return; }
+    if (what === 'snapshot') {
+      if (!window.confirm('把当前工作区状态设为新基线？当前所有未确认变更都会被标记为已接受。')) { return; }
+      call('changes.snapshot').then(function (d) { S.changes = d; renderChanges(false); toast('基线已重设'); }).catch(function (e) { toast(e.message, true); });
+      return;
+    }
+    if (what === 'accept-all') {
+      if (!window.confirm('接受全部变更（基线更新为当前状态）？')) { return; }
+      call('changes.accept', { paths: [] }).then(function (d) { S.changes = d; renderChanges(false); toast('已接受全部变更'); }).catch(function (e) { toast(e.message, true); });
+      return;
+    }
+    if (!path) { toast('先选一个文件', true); return; }
+    if (what === 'accept') {
+      call('changes.accept', { paths: [path] }).then(function (d) { S.changes = d; renderChanges(false); toast('已接受：' + path); }).catch(function (e) { toast(e.message, true); });
+    } else if (what === 'revert') {
+      if (!window.confirm('把 ' + path + ' 回滚为基线内容？这一操作会覆盖当前文件。')) { return; }
+      call('changes.revert', { paths: [path] }).then(function (d) {
+        S.changes = d;
+        renderChanges(false);
+        toast('已回滚：' + path);
+        if (S.file === path) { openFile(path); }
+      }).catch(function (e) { toast(e.message, true); });
+    } else if (what === 'edit') {
+      openEditor(path);
+    }
+  }
+
+  // ---------------------------------------------------------------- 编辑器（预览后 Apply）
+  function openEditor(path) {
+    S.editor.path = path;
+    S.editor.previewing = false;
+    ui.editor.classList.remove('wb-preview');
+    ui.editorToggle.textContent = '预览差异';
+    ui.editorPath.textContent = path;
+    ui.editor.classList.add('wb-on');
+    ui.editorText.value = '';
+    ui.editorDiff.innerHTML = '';
+    call('fs.read', { path: path }).then(function (d) {
+      ui.editorText.value = d.kind === 'text' ? (d.text || '') : '';
+      ui.editorText.focus();
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  function editorTogglePreview() {
+    if (!S.editor.path) { return; }
+    if (S.editor.previewing) {
+      S.editor.previewing = false;
+      ui.editor.classList.remove('wb-preview');
+      ui.editorToggle.textContent = '预览差异';
+      return;
+    }
+    call('fs.preview', { path: S.editor.path, text: ui.editorText.value }).then(function (d) {
+      ui.editorDiff.innerHTML = '';
+      if (!d.rows || d.rows.length === 0) { ui.editorDiff.appendChild(el('div', 'wb-empty', '与磁盘内容一致，没有差异')); }
+      else { ui.editorDiff.appendChild(renderDiff(d.rows)); }
+      S.editor.previewing = true;
+      ui.editor.classList.add('wb-preview');
+      ui.editorToggle.textContent = '继续编辑';
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  // 应用前先算一次差异：删掉大半个文件时必须让人明确确认一次
+  //（v3.5 开发中真的发生过「编辑器开着 A 文件、一键应用把 A 覆盖成三行」）
+  function editorApply() {
+    if (!S.editor.path) { return; }
+    var path = S.editor.path;
+    var text = ui.editorText.value;
+    var doSave = function () {
+      call('fs.save', { path: path, text: text }).then(function () {
+        toast('已写入：' + path);
+        ui.editor.classList.remove('wb-on');
+        if (S.file === path) { openFile(path); }
+        loadChanges();
+      }).catch(function (err) { toast(err.message, true); });
+    };
+    call('fs.preview', { path: path, text: text }).then(function (d) {
+      var dels = d.dels || 0;
+      var oldLines = d.oldLines || 0;
+      if (oldLines >= 40 && dels >= 20 && dels * 4 >= oldLines) {
+        var ok = window.confirm('这次写入会删除原来的 ' + dels + ' / ' + oldLines + ' 行（共 +' + (d.adds || 0) + ' 行新增）。\n确认覆盖 ' + path + ' ？');
+        if (!ok) { return; }
+      }
+      doSave();
+    }).catch(function () { doSave(); });
+  }
+
+  // ---------------------------------------------------------------- Git
+  function loadGit() {
+    call('git.info').then(function (d) {
+      S.git = d;
+      renderGit();
+    }).catch(function (err) { ui.gitList.innerHTML = ''; ui.gitList.appendChild(el('div', 'wb-muted', err.message)); });
+  }
+
+  function renderGit() {
+    var d = S.git || {};
+    if (!d.available) { ui.gitBranch.textContent = 'git 不可用'; ui.gitHead.textContent = d.reason || ''; }
+    else if (!d.repo) { ui.gitBranch.textContent = '不是 git 仓库'; ui.gitHead.textContent = d.reason || ''; }
+    else {
+      ui.gitBranch.textContent = d.branch || '(detached)';
+      ui.gitHead.textContent = d.head + ' · 暂存 ' + d.stagedCount + ' / 未暂存 ' + d.unstagedCount + ' / 未跟踪 ' + d.untrackedCount;
+    }
+    var list = ui.gitList;
+    list.innerHTML = '';
+    var changes = d.changes || [];
+    if (changes.length === 0) { list.appendChild(el('div', 'wb-muted', '没有未提交变更')); }
+    for (var i = 0; i < changes.length; i++) {
+      var c = changes[i];
+      var row = el('div', 'wb-item');
+      row.setAttribute('data-path', c.path);
+      row.setAttribute('data-status', 'modified');
+      if (c.path === S.gitSel) { row.classList.add('wb-on'); }
+      row.appendChild(el('span', 'wb-st', (c.xy || 'M ').trim() || 'M'));
+      row.appendChild(el('span', 'wb-p', c.path));
+      (function (path) { row.addEventListener('click', function () { showGitDiff(path); }); })(c.path);
+      list.appendChild(row);
+    }
+    var commits = d.commits || [];
+    if (commits.length > 0) {
+      list.appendChild(el('div', 'wb-muted', '最近提交'));
+      for (var k = 0; k < commits.length; k++) {
+        var cm = commits[k];
+        var r2 = el('div', 'wb-item');
+        r2.setAttribute('data-status', 'added');
+        r2.appendChild(el('span', 'wb-st', '·'));
+        r2.appendChild(el('span', 'wb-p', cm.hash + '  ' + cm.subject));
+        r2.appendChild(el('span', 'wb-stat', cm.date));
+        (function (commit) {
+          r2.addEventListener('click', function () {
+            S.gitSel = null;
+            ui.gitPath.textContent = '提交 ' + commit.hash;
+            ui.gitBody.innerHTML = '';
+            var box = el('div', 'wb-empty');
+            box.style.textAlign = 'left';
+            box.style.display = 'block';
+            box.style.padding = '18px 22px';
+            box.innerHTML = '';
+            box.appendChild(el('div', null, commit.subject));
+            box.appendChild(el('div', 'wb-muted', commit.hash + ' · ' + commit.author + ' · ' + commit.date));
+            ui.gitBody.appendChild(box);
+          });
+        })(cm);
+        list.appendChild(r2);
+      }
+    }
+  }
+
+  function showGitDiff(path) {
+    S.gitSel = path;
+    var rows = ui.gitList.querySelectorAll('.wb-item');
+    for (var i = 0; i < rows.length; i++) { rows[i].classList.toggle('wb-on', rows[i].getAttribute('data-path') === path); }
+    ui.gitPath.textContent = path;
+    ui.gitBody.innerHTML = '';
+    ui.gitBody.appendChild(el('div', 'wb-empty', '读取差异…'));
+    call('git.diff', { path: path }).then(function (d) {
+      ui.gitBody.innerHTML = '';
+      if (d.rows) { ui.gitBody.appendChild(renderDiff(d.rows)); return; }
+      var text = d.text || '';
+      if (!text) { ui.gitBody.appendChild(el('div', 'wb-empty', d.note || '没有差异')); return; }
+      var box = el('div', 'wb-diff');
+      var lines = text.replace(/\r/g, '').split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        var row = el('div', 'wb-dr');
+        var cls = line.charAt(0) === '+' ? ' wb-ins' : line.charAt(0) === '-' ? ' wb-del' : '';
+        row.className += cls;
+        row.appendChild(el('span', 'wb-sg', line.charAt(0)));
+        var src = el('span', 'wb-src');
+        src.textContent = line.slice(1);
+        row.appendChild(src);
+        box.appendChild(row);
+      }
+      ui.gitBody.appendChild(box);
+    }).catch(function (err) {
+      ui.gitBody.innerHTML = '';
+      ui.gitBody.appendChild(el('div', 'wb-empty', err.message));
+    });
+  }
+
+  // ---------------------------------------------------------------- 底部与轮询
+  function updateFoot() {
+    var a = S.agent || {};
+    var state = a.state || 'unknown';
+    var dot = ui.dot;
+    dot.className = 'wb-dot' + (state === 'running' ? ' wb-busy' : (S.changes && S.changes.count > 0 ? ' wb-run' : ''));
+    var label = state === 'running' ? 'Agent 工作中' : state === 'idle' ? 'Agent 空闲' : 'Agent 状态未知';
+    if (a.title) { label += ' · ' + a.title; }
+    ui.footState.textContent = label;
+    if (S.changes) { ui.footRight.textContent = '未确认变更 ' + (S.changes.count || 0) + ' 个'; }
+  }
+
+  function startPoll() {
+    stopPoll();
+    S.poll = setInterval(function () { if (S.tab === 'diff') { loadChanges(true); } }, 5000);
+  }
+
+  function stopPoll() {
+    if (S.poll) { clearInterval(S.poll); S.poll = null; }
+  }
+
+  // ---------------------------------------------------------------- 事件绑定
+  function bind() {
+    ui.launcher.addEventListener('click', function () { toggle(); });
+    var closers = ui.root.querySelectorAll('[data-close]');
+    for (var i = 0; i < closers.length; i++) { closers[i].addEventListener('click', function () { setOpen(false); }); }
+
+    ui.tabs.addEventListener('click', function (e) {
+      var t = e.target.closest ? e.target.closest('.wb-tab') : null;
+      if (t) { setTab(t.getAttribute('data-tab')); }
+    });
+
+    ui.ws.addEventListener('click', function () {
+      call('ws.pick').then(function (d) {
+        S.ws = d.workspace || S.ws;
+        ui.wsPath.textContent = S.ws;
+        S.file = null;
+        S.changes = null;
+        S.changesSel = null;
+        loadRoot();
+        loadChanges(true);
+        loadGit();
+        refreshAgent();
+        toast('工作区已切换到 ' + S.ws);
+      }).catch(function (err) { if (err.message !== '已取消') { toast(err.message, true); } });
+    });
+
+    // 文件
+    ui.fileSearch.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { searchFiles(e.shiftKey ? 'content' : 'name'); }
+      if (e.key === 'Escape') { ui.fileSearch.value = ''; loadRoot(); }
+    });
+    var fsBtns = ui.root.querySelectorAll('[data-fs]');
+    for (var f = 0; f < fsBtns.length; f++) {
+      (function (btn) {
+        btn.addEventListener('click', function () {
+          var act = btn.getAttribute('data-fs');
+          if (!S.file) { toast('先选一个文件', true); return; }
+          if (act === 'copy') { copyText(S.file); toast('已复制路径'); }
+          else if (act === 'at') {
+            var text = '@' + S.file + ' ';
+            copyText(text);
+            var ok = false;
+            try { ok = insertIntoComposer(text); } catch (e) { ok = false; }
+            toast(ok ? '已插入 @' + S.file : '已复制「@' + S.file + '」，粘贴到 DSH 输入框即可');
+          } else if (act === 'reveal') { call('fs.reveal', { path: S.file }).catch(function (e) { toast(e.message, true); }); }
+          else if (act === 'edit') { openEditor(S.file); }
+        });
+      })(fsBtns[f]);
+    }
+
+    // 终端
+    ui.cmd.addEventListener('input', checkPolicy);
+    ui.cmd.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); runCommand(false); return; }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (S.term.hist.length === 0) { return; }
+        if (S.term.idx < 0) { S.term.idx = S.term.hist.length - 1; } else if (S.term.idx > 0) { S.term.idx--; }
+        ui.cmd.value = S.term.hist[S.term.idx] || '';
+        checkPolicy();
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (S.term.idx < 0) { return; }
+        S.term.idx++;
+        if (S.term.idx >= S.term.hist.length) { S.term.idx = -1; ui.cmd.value = ''; } else { ui.cmd.value = S.term.hist[S.term.idx] || ''; }
+        checkPolicy();
+      }
+    });
+    ui.run.addEventListener('click', function () { runCommand(false); });
+    ui.confirmYes.addEventListener('click', function () {
+      var cmd = S.term.pendingCmd;
+      hideConfirm();
+      if (cmd) { runCommand(true, cmd); }
+    });
+    ui.confirmNo.addEventListener('click', function () { hideConfirm(); termWrite('[工作台] 已取消\n', 'wb-sys'); });
+    ui.termStop.addEventListener('click', function () {
+      if (!S.term.runId) { toast('没有正在运行的命令', true); return; }
+      call('term.kill', { runId: S.term.runId }).then(function () { termWrite('[工作台] 已请求停止\n', 'wb-sys'); }).catch(function (e) { toast(e.message, true); });
+    });
+    ui.termClear.addEventListener('click', function () { ui.termOut.innerHTML = ''; });
+    ui.shell.addEventListener('change', function () { checkPolicy(); });
+
+    // 变更
+    var chBtns = ui.root.querySelectorAll('[data-ch]');
+    for (var c = 0; c < chBtns.length; c++) {
+      (function (btn) { btn.addEventListener('click', function () { changeAction(btn.getAttribute('data-ch')); }); })(chBtns[c]);
+    }
+    var gitBtns = ui.root.querySelectorAll('[data-git]');
+    for (var g = 0; g < gitBtns.length; g++) {
+      (function (btn) {
+        btn.addEventListener('click', function () {
+          var act = btn.getAttribute('data-git');
+          if (act === 'refresh') { loadGit(); return; }
+          if (act === 'copy') {
+            var p = S.gitSel || (S.changesSel || '');
+            var text = p ? ('git diff -- ' + p) : 'git status';
+            copyText(text);
+            toast('已复制：' + text);
+          }
+        });
+      })(gitBtns[g]);
+    }
+
+    // 编辑器
+    ui.editorClose.addEventListener('click', function () { ui.editor.classList.remove('wb-on'); });
+    ui.editorToggle.addEventListener('click', editorTogglePreview);
+    ui.editorApply.addEventListener('click', editorApply);
+
+    // 快捷键
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'F2' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggle();
+        return;
+      }
+      if (e.key === 'Escape' && S.open) {
+        if (ui.editor.classList.contains('wb-on')) { ui.editor.classList.remove('wb-on'); return; }
+        setOpen(false);
+      }
+    }, true);
+  }
+
+  // ---------------------------------------------------------------- 启动
+  function mount() {
+    if (document.getElementById(HOST_ID)) { return; }
+    var host = document.createElement('div');
+    host.id = HOST_ID;
+    host.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483001;';
+    var root = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host;
+    var style = document.createElement('style');
+    style.textContent = __WB_CSS__;
+    root.appendChild(style);
+    var wrap = document.createElement('div');
+    wrap.innerHTML = __WB_HTML__;
+    root.appendChild(wrap);
+    document.body.appendChild(host);
+
+    ui.root = root.getElementById('wb-root');
+    ui.launcher = root.getElementById('wb-launcher');
+    ui.tabs = root.getElementById('wb-tabs');
+    ui.panes = root.querySelectorAll('.wb-pane');
+    ui.ws = root.getElementById('wb-ws');
+    ui.wsPath = root.getElementById('wb-ws-path');
+    ui.ver = root.getElementById('wb-ver');
+    ui.tree = root.getElementById('wb-tree');
+    ui.fileSearch = root.getElementById('wb-file-search');
+    ui.fileView = root.getElementById('wb-file-view');
+    ui.filePath = root.getElementById('wb-file-path');
+    ui.shell = root.getElementById('wb-shell');
+    ui.cwd = root.getElementById('wb-cwd');
+    ui.policy = root.getElementById('wb-policy');
+    ui.cmd = root.getElementById('wb-cmd');
+    ui.run = root.getElementById('wb-run');
+    ui.termOut = root.getElementById('wb-term-out');
+    ui.termStop = root.getElementById('wb-term-stop');
+    ui.termClear = root.getElementById('wb-term-clear');
+    ui.confirm = root.getElementById('wb-confirm');
+    ui.confirmText = root.getElementById('wb-confirm-text');
+    ui.confirmYes = root.getElementById('wb-confirm-yes');
+    ui.confirmNo = root.getElementById('wb-confirm-no');
+    ui.goalText = root.getElementById('wb-goal-text');
+    ui.goalMeta = root.getElementById('wb-goal-meta');
+    ui.events = root.getElementById('wb-events');
+    ui.feedMeta = root.getElementById('wb-feed-meta');
+    ui.chSummary = root.getElementById('wb-ch-summary');
+    ui.chList = root.getElementById('wb-ch-list');
+    ui.diffPath = root.getElementById('wb-diff-path');
+    ui.diffBody = root.getElementById('wb-diff-body');
+    ui.gitBranch = root.getElementById('wb-git-branch');
+    ui.gitHead = root.getElementById('wb-git-head');
+    ui.gitList = root.getElementById('wb-git-list');
+    ui.gitPath = root.getElementById('wb-git-path');
+    ui.gitBody = root.getElementById('wb-git-body');
+    ui.editor = root.getElementById('wb-editor');
+    ui.editorPath = root.getElementById('wb-editor-path');
+    ui.editorText = root.getElementById('wb-editor-text');
+    ui.editorDiff = root.getElementById('wb-editor-diff');
+    ui.editorToggle = root.getElementById('wb-editor-toggle');
+    ui.editorApply = root.getElementById('wb-editor-apply');
+    ui.editorClose = root.getElementById('wb-editor-close');
+    ui.dot = root.getElementById('wb-dot');
+    ui.footState = root.getElementById('wb-foot-state');
+    ui.footRight = root.getElementById('wb-foot-right');
+    ui.toastWrap = root.getElementById('wb-toast-wrap');
+
+    var wv = api();
+    if (wv) { wv.addEventListener('message', onMessage); }
+    bind();
+    ui.ver.textContent = 'v' + __WB_VER__;
+    window.__DSH_WORKBENCH__ = {
+      toggle: toggle,
+      open: function (tab) { openTab(tab || 'files'); },
+      close: function () { setOpen(false); },
+      isOpen: function () { return S.open; }
+    };
+    // 首屏先把目标/任务读出来（不需要用户先打开抽屉）
+    setTimeout(function () { ensureHello(); }, 300);
+    setTimeout(function () { refreshAgent(); }, 1400);
+  }
+
+  function start() {
+    if (document.body) { mount(); return; }
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries++;
+      if (document.body) { clearInterval(timer); mount(); return; }
+      if (tries > 200) { clearInterval(timer); }
+    }, 25);
+  }
+
+  start();
+})();
+<!--@/SCRIPT@-->

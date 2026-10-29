@@ -22,8 +22,15 @@ if not exist "%WV2_CORE%" (
     pause
     exit /b 1
 )
+rem ---- v3.5: workbench UI is embedded into the exe (single-file distribution) ----
+set "WB_UI=%DIR%workbench\ui.html"
+if not exist "%WB_UI%" (
+    echo [build] %WB_UI% not found - the workbench UI is required.
+    pause
+    exit /b 1
+)
 echo [build] Compiling dsh-panel.exe ...
-"%CSC%" /nologo /optimize+ /target:winexe /platform:x64 /codepage:65001 /win32manifest:"%DIR%dsh-panel.manifest" /win32icon:"%DIR%dsh-panel.ico" /reference:"%WV2_CORE%" /reference:"%WV2_WF%" /out:"%DIR%dsh-panel.exe" "%DIR%dsh-panel.cs"
+"%CSC%" /nologo /optimize+ /target:winexe /platform:x64 /codepage:65001 /win32manifest:"%DIR%dsh-panel.manifest" /win32icon:"%DIR%dsh-panel.ico" /reference:"%WV2_CORE%" /reference:"%WV2_WF%" /reference:System.Web.Extensions.dll /resource:"%WB_UI%",dsh-workbench-ui.html /out:"%DIR%dsh-panel.exe" "%DIR%dsh-panel.cs" "%DIR%dsh-workbench.cs"
 if errorlevel 1 (
     echo [build] Compilation FAILED.
     pause

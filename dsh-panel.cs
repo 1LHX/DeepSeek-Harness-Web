@@ -38,6 +38,29 @@
 //       stop-dsh 注释过滤、设置页端口文案动态化；删除死代码（StatusLine/miEmbed 等）；
 //       开关重绘为胶囊拨动开关、设置页清除浏览器缓存、检测超时三态提示、
 //       状态胶囊 tooltip、设置页浏览器端口检查；关于文案单一来源（AboutText）。
+// v3.2（启动提速）：服务启动不再等 check-dsh 完成——先用纯文件系统探测（FindDshBinJs）
+//       判定 dsh 可用就立刻起服务，检测结果只决定是否显示安装指引（并行、不阻塞）；
+//       启动/停止过渡期端口轮询由 2s 收紧到 300ms，就绪后页面最多早 1.7s 出现；
+//       启动各阶段（窗口显示/服务就绪/内嵌浏览器就绪/已导航）写入
+//       run/boot-timing.log，与 start-service.ps1 的分段耗时同文件，便于定位慢在哪。
+// v3.3（可靠性）：端口被别的程序占用时服务自动顺延，面板按「监听进程 PID == pid 文件」
+//       校验后采纳 run/dsh-web.port 里的真实端口（残留文件绝不会把面板指向别人的服务）；
+//       崩溃自动恢复改为指数退避（5/15/30/60/120/300 秒）且以「连续健康 120 秒」为复位条件；
+//       新增 HTTP 健康检查（绕过系统代理），仅用于展示与日志，绝不触发重启。
+// v3.4（快启动路径）：面板优先用 node 直接跑 dsh-launch.mjs 启动服务——node 冷启动约 0.1s，
+//       而 PowerShell 5.1 冷启动约 1.45s（实测整条链 5.84s 里这一项占 1.9s）。启动器只做
+//       「直连 bin.js」+「编译缓存钩子」，任何异常同步转交 start-service.ps1，因此策略仍只有一套；
+//       ShellExecute 失败时同样回退原来的 PowerShell 路径。
+// v3.4.1（端口采纳收紧）：SyncActivePort 采纳 run/dsh-web.port 时**必须**有可验证的 pid
+//       （以前 pid 读不到时只要求端口在监听，于是「残留 port 文件 + 别的程序占了该端口」
+//       会让内嵌浏览器导航到别人的服务上）；pid 文件失效时一并删除端口记录。
+// v3.5（工作台）：从「控制面板」变成「能干活的工作台」——主界面注入一个 Shadow DOM 抽屉
+//       （workbench/ui.html，不进 DSH 自己的 DOM/CSS），五个页签：
+//         文件（懒加载树 + 预览 + @ 引用直接插入 DSH 输入框）、
+//         终端（PowerShell/cmd，命令白名单 + 危险命令二次确认 + 每次执行进活动日志）、
+//         任务（直接读 DSH 会话事件流的 todo/write 与 goal/change，边车 workbench/session-reader.mjs）、
+//         变更（工作区基线快照 + 行级 diff + 接受/回滚/预览后 Apply）、Git（分支/提交/未提交变更）。
+//       桥接实现集中在 dsh-workbench.cs（本文件只做接线与顶栏入口）。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -61,8 +84,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.1.1.0")]
-[assembly: AssemblyFileVersion("3.1.1.0")]
+[assembly: AssemblyVersion("3.5.0.0")]
+[assembly: AssemblyFileVersion("3.5.0.0")]
 
 namespace DshPanel
 {
@@ -209,6 +232,7 @@ namespace DshPanel
 
         internal static string ScriptRoot;
         internal static string PidFile;
+        internal static string PortFile;               // v3.3：实际监听端口的记录（端口冲突顺延后以它为准）
         internal static string OutLog;
         internal static string ErrLog;
         static string SelfTestLog;
@@ -220,13 +244,28 @@ namespace DshPanel
         internal static bool everRan;                  // 本会话内服务曾成功运行
         internal static bool manualStop;               // 用户手动停止（抑制自动恢复）
         internal static bool autoRestartEnabled;       // 崩溃自动恢复开关（默认关，托盘菜单切换）
+        internal static bool updateCheckEnabled = true; // v3.3：更新提示开关（dsh-web.config 可关）
         internal static int autoRestartCount;
         internal static long lastRestartTick;
         internal static long serviceUpSince;           // 服务本次运行起始时刻（Environment.TickCount）
+        internal static long serviceHealthySince;      // v3.3：连续健康起始时刻（退避复位用）
         static IntPtr serviceJob = IntPtr.Zero;        // 启动时绑定的 Job Object（停止时整树终止）
         static Mutex singleMutex;
         internal static MainForm Instance;
         internal static Action onStopped;               // 停止完成后回调（「退出并停止服务」用）
+
+        // ---------- v3.3：健康检查（只用于展示与日志，绝不触发重启） ----------
+        // 端口能连上 ≈ 进程在；HTTP 能应答 ≈ 服务真的活着。
+        // 但 DSH 的 HTTP 服务在长任务期间可能短暂不应答（单线程事件循环忙），
+        // 把「暂时不应答」当成崩溃去重启是危险的，所以这里只做观测。
+        // v3.5：内嵌浏览器调试端口（默认 0 = 关闭）。只给开发/自动化巡检用：
+        // 开启后本机任何进程都能通过 CDP 连上这个 WebView（等于拿到工作台的桥接口），
+        // 所以默认关闭，且只在 dsh-web.config 里显式写 debugport 时才生效。
+        internal static int debugPort;
+
+        internal static int healthMs = -1;              // 最近一次 /  的应答毫秒数；-1 = 失败
+        internal static int healthFailStreak;           // 连续失败次数
+        static long healthProbedAt;
 
         // 活动日志事件（任何线程可调，转发到 UI 线程渲染）
         internal static void LogEvent(LogKind kind, string text)
@@ -247,6 +286,7 @@ namespace DshPanel
             try { Directory.CreateDirectory(logsDir); } catch { }
             try { Directory.CreateDirectory(runDir); } catch { }
             PidFile = Path.Combine(runDir, "dsh-web.pid");
+            PortFile = Path.Combine(runDir, "dsh-web.port");
             OutLog = Path.Combine(logsDir, "dsh-web.log");
             ErrLog = Path.Combine(logsDir, "dsh-web.err.log");
             SelfTestLog = Path.Combine(logsDir, "dsh-web.selftest.log");
@@ -300,6 +340,7 @@ namespace DshPanel
                 catch { }
             }
             try { File.Delete(PidFile); } catch { }
+            try { File.Delete(PortFile); } catch { }
         }
 
         // 旧版本（v1.3 及以前）把运行时产物放在根目录：迁移到 logs/ 与 run/。
@@ -355,6 +396,17 @@ namespace DshPanel
                             int p;
                             if (int.TryParse(value, out p) && p > 0 && p < 65536) Program.Port = p;
                         }
+                        else if (key == "debugport")
+                        {
+                            int dp;
+                            if (int.TryParse(value, out dp) && dp > 0 && dp < 65536) Program.debugPort = dp;
+                        }
+                        else if (key == "updatecheck")
+                        {
+                            // v3.3：更新提示开关（默认开；写 updatecheck=0 关闭）
+                            string v = value.ToLowerInvariant();
+                            Program.updateCheckEnabled = !(v == "0" || v == "false" || v == "off" || v == "no");
+                        }
                     }
                 }
                 catch { }
@@ -362,6 +414,54 @@ namespace DshPanel
         }
 
         // ---------- npx-cli 自动探测（默认路径 + 注册表 + x86） ----------
+
+        // v3.4：定位 node.exe（PATH -> 由 npx-cli 反推的 node 目录 -> 默认布局）。
+        // 快路径启动器 dsh-launch.mjs 需要一个 node.exe 来跑；找不到就回退到 PowerShell 路径。
+        internal static string FindNodeExe()
+        {
+            try
+            {
+                string pathEnv = Environment.GetEnvironmentVariable("PATH");
+                if (!string.IsNullOrEmpty(pathEnv))
+                {
+                    foreach (string raw in pathEnv.Split(';'))
+                    {
+                        string dir = raw.Trim().Trim('"');
+                        if (dir.Length == 0) continue;
+                        try
+                        {
+                            string cand = Path.Combine(dir, "node.exe");
+                            if (File.Exists(cand)) return cand;
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                string npxCli = FindNpxCli();
+                if (File.Exists(npxCli))
+                {
+                    // ...\nodejs\node_modules\npm\bin\npx-cli.js -> ...\nodejs\node.exe
+                    string nodeDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(npxCli)));
+                    if (!string.IsNullOrEmpty(nodeDir))
+                    {
+                        string cand = Path.Combine(nodeDir, "node.exe");
+                        if (File.Exists(cand)) return cand;
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                string fallback = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "nodejs", "node.exe");
+                if (File.Exists(fallback)) return fallback;
+            }
+            catch { }
+            return null;
+        }
 
         static string FindNpxCli()
         {
@@ -491,6 +591,239 @@ namespace DshPanel
             return serviceJob != IntPtr.Zero;
         }
 
+        // ---------- v3.4.2：启动自检（把「静默失败」变成「看得见」） ----------
+
+        // 纯 .NET 字节检查：不 spawn 任何进程，几毫秒完成，绝不拖慢启动。
+        // 覆盖本项目真实踩过的两类坑，都是在「写的时候看不出、跑起来才炸」的：
+        //   1) .ps1 含非 ASCII 却没有 UTF-8 BOM —— Windows PowerShell 5.1 按 ANSI 读，
+        //      一条中文注释就让整个脚本语法错误，表现是「服务静默起不来、日志一个字都没有」；
+        //   2) .cmd 含非 ASCII —— cmd.exe 按 OEM 代码页解析，会报「xxx 不是内部或外部命令」，
+        //      严重时把注释行当命令执行。
+        // 另外比对「源码 AssemblyVersion」与「正在运行的 exe 版本」：
+        // 「源码改了、exe 没重编」在本项目发生过两次，症状是「所有验证都通过，但跑的是旧逻辑」。
+        // 只报告、不阻塞——自检发现问题时服务可能起不来，但面板本身必须能用（用户才有救火入口）。
+        internal static void ScriptHealthCheckAsync()
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                int issues = 0;
+                try
+                {
+                    foreach (string pattern in new string[] { "*.ps1", "*.cmd" })
+                    {
+                        foreach (string file in Directory.GetFiles(ScriptRoot, pattern))
+                        {
+                            try
+                            {
+                                byte[] bytes = File.ReadAllBytes(file);
+                                bool nonAscii = false;
+                                for (int i = 0; i < bytes.Length; i++)
+                                {
+                                    if (bytes[i] > 0x7F) { nonAscii = true; break; }
+                                }
+                                if (!nonAscii) continue;
+                                bool bom = bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF;
+                                string name = Path.GetFileName(file);
+                                if (pattern == "*.cmd")
+                                {
+                                    issues++;
+                                    LogEvent(LogKind.Warn, "自检：" + name + " 含非 ASCII 字符 —— cmd.exe 会解析失败（批处理请只写英文）");
+                                }
+                                else if (!bom)
+                                {
+                                    issues++;
+                                    LogEvent(LogKind.Warn, "自检：" + name + " 含中文但没有 UTF-8 BOM —— PS 5.1 会按 ANSI 读，脚本会语法错误");
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+
+                    // 源码版本 vs 运行中的 exe
+                    try
+                    {
+                        string cs = Path.Combine(ScriptRoot, "dsh-panel.cs");
+                        if (File.Exists(cs))
+                        {
+                            string text = File.ReadAllText(cs);
+                            System.Text.RegularExpressions.Match m =
+                                System.Text.RegularExpressions.Regex.Match(text, "AssemblyVersion\\(\"([0-9]+(?:\\.[0-9]+){1,3})\"\\)");
+                            string running = null;
+                            try
+                            {
+                                running = FileVersionInfo.GetVersionInfo(
+                                    System.Reflection.Assembly.GetExecutingAssembly().Location).FileVersion;
+                            }
+                            catch { }
+                            if (m.Success && !string.IsNullOrEmpty(running) &&
+                                m.Groups[1].Value.Trim() != running.Trim())
+                            {
+                                issues++;
+                                LogEvent(LogKind.Warn, "自检：正在运行的是 v" + running + "，但源码已是 v" +
+                                    m.Groups[1].Value + " —— 现在跑的是旧逻辑，请运行 apply-panel-update.cmd");
+                            }
+                        }
+                    }
+                    catch { }
+
+                    BootMark("selfcheck: " + (issues == 0 ? "ok" : issues + " issue(s)"));
+                    if (issues > 0)
+                    {
+                        LogEvent(LogKind.Warn, "自检发现 " + issues + " 项问题，完整报告：powershell -NoProfile -File check-scripts.ps1");
+                    }
+                }
+                catch { }
+            });
+        }
+
+        // ---------- v3.2：启动提速与启动分段打点 ----------
+
+        // 本进程启动时刻：boot-timing.log 用相对时间，跨 panel / start-service.ps1 可对齐
+        static readonly DateTime processStartUtc = SafeProcessStartUtc();
+
+        static DateTime SafeProcessStartUtc()
+        {
+            try { return Process.GetCurrentProcess().StartTime.ToUniversalTime(); }
+            catch { return DateTime.UtcNow; }
+        }
+
+        // 启动阶段打点：run/boot-timing.log（与 start-service.ps1 写同一个文件）。
+        // 只在启动/停止过渡期调用，量级为毫秒；任何异常都不向外抛——打点绝不能影响启动。
+        internal static void BootMark(string phase)
+        {
+            try
+            {
+                string runDir = Path.Combine(ScriptRoot, "run");
+                Directory.CreateDirectory(runDir);
+                string file = Path.Combine(runDir, "boot-timing.log");
+                try
+                {
+                    FileInfo fi = new FileInfo(file);
+                    if (fi.Exists && fi.Length > 256 * 1024)
+                    {
+                        string old = file + ".1";
+                        if (File.Exists(old)) File.Delete(old);
+                        File.Move(file, old);
+                    }
+                }
+                catch { }
+                long ms = (long)(DateTime.UtcNow - processStartUtc).TotalMilliseconds;
+                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") +
+                    " [panel] " + phase + " (+" + ms.ToString() + "ms)";
+                // 与 start-service.ps1 可能同时写入：共享读写打开，谁也阻塞不了谁
+                using (FileStream fs = new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                using (StreamWriter sw = new StreamWriter(fs, new UTF8Encoding(false)))
+                {
+                    sw.Write(line + Environment.NewLine);
+                }
+            }
+            catch { }
+        }
+
+        // ---------- v3.3：崩溃自动恢复的指数退避 ----------
+
+        // 第 n 次恢复前至少等待的秒数：5, 15, 30, 60, 120, 300 —— 数组长度同时就是最大尝试次数。
+        // 固定 60 秒窗 + 3 次上限的老策略有两种失效：起不来的服务被反复重试，或者
+        // 每隔一分钟打断用户一次。退避让「早期快速恢复」与「长期不打扰」同时成立。
+        internal static readonly int[] RestartBackoffSeconds = { 5, 15, 30, 60, 120, 300 };
+
+        internal static int RestartBackoffMs(int attempt)
+        {
+            int i = attempt;
+            if (i < 0) i = 0;
+            if (i >= RestartBackoffSeconds.Length) i = RestartBackoffSeconds.Length - 1;
+            return RestartBackoffSeconds[i] * 1000;
+        }
+
+        // ---------- v3.3：更新提示（只提示，不自动升级） ----------
+
+        // check-update.ps1 走 npm 自己的镜像/代理配置，结果按 24 小时节流写
+        // run/update-check.txt；这里只负责跑脚本、读结论、上报一句话。
+        // 严禁在这里做任何安装动作：升级必须由用户自己确认执行（README 里给了命令）。
+        internal static void CheckUpdateAsync(Action<string> done)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string summary = null;
+                try
+                {
+                    string resultFile = Path.Combine(ScriptRoot, "run", "update-check.txt");
+                    string ignored;
+                    RunScriptWaitResult("check-update.ps1", resultFile, 45000, out ignored);
+                    if (File.Exists(resultFile))
+                    {
+                        string current = null, latest = null, upgrade = null, error = null;
+                        foreach (string line in File.ReadAllLines(resultFile))
+                        {
+                            int eq = line.IndexOf('=');
+                            if (eq <= 0) continue;
+                            string k = line.Substring(0, eq).Trim();
+                            string v = line.Substring(eq + 1).Trim();
+                            if (k == "current") current = v;
+                            else if (k == "latest") latest = v;
+                            else if (k == "upgrade") upgrade = v;
+                            else if (k == "error") error = v;
+                        }
+                        if (error != null) summary = "更新检查未完成：" + error;
+                        else if (upgrade == "yes") summary = "有新版本可用：" + current + " → " + latest;
+                        else summary = "已是最新版本：" + current;
+                    }
+                }
+                catch { }
+                if (done != null)
+                {
+                    try { done(summary); } catch { }
+                }
+            });
+        }
+
+        // 定位已安装的 dsh 入口（纯文件系统，不启动任何进程）。
+        // 顺序与 start-service.ps1 的 Resolve-DshBinJs 保持一致：
+        // npx 缓存（取最新）-> 全局 npm -> node.exe 旁。
+        // 用途：面板在 check-dsh 结论之前就能判断「能不能启动服务」，让启动与检测并行。
+        internal static string FindDshBinJs()
+        {
+            try
+            {
+                string npxRoot = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "npm-cache", "_npx");
+                string best = null;
+                DateTime bestTime = DateTime.MinValue;
+                if (Directory.Exists(npxRoot))
+                {
+                    foreach (string d in Directory.GetDirectories(npxRoot))
+                    {
+                        string cand = Path.Combine(d, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+                        if (!File.Exists(cand)) continue;
+                        DateTime t = File.GetLastWriteTimeUtc(cand);
+                        if (best == null || t > bestTime) { best = cand; bestTime = t; }
+                    }
+                }
+                if (best != null) return best;
+
+                string global = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "npm", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+                if (File.Exists(global)) return global;
+
+                // node.exe 所在目录下的 node_modules（npm install 到 node 目录的情形）
+                try
+                {
+                    string npxCli = FindNpxCli();
+                    if (File.Exists(npxCli))
+                    {
+                        string nodeDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(npxCli)));
+                        string beside = Path.Combine(nodeDir, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+                        if (File.Exists(beside)) return beside;
+                    }
+                }
+                catch { }
+            }
+            catch { }
+            return null;
+        }
+
         // 托盘气泡通知（任何线程可调，内部转发到 UI 线程）
         internal static void ShowBalloon(string title, string text, ToolTipIcon icon)
         {
@@ -521,12 +854,18 @@ namespace DshPanel
 
         internal static bool IsPortOpen()
         {
+            return IsPortOpenOn(Port);
+        }
+
+        // 任意端口的探测（端口冲突顺延后要探另一个端口）
+        internal static bool IsPortOpenOn(int port)
+        {
             TcpClient client = new TcpClient();
             try
             {
                 // 异步连接 + 300ms 硬超时：某些网络过滤（如代理 TUN 模式）会静默丢弃
                 // 回环 SYN，导致同步 Connect 最长阻塞约 2 秒——UI 线程绝不允许这种情况
-                IAsyncResult ar = client.BeginConnect(IPAddress.Loopback, Port, null, null);
+                IAsyncResult ar = client.BeginConnect(IPAddress.Loopback, port, null, null);
                 if (!ar.AsyncWaitHandle.WaitOne(300))
                 {
                     return false;
@@ -541,6 +880,97 @@ namespace DshPanel
             finally
             {
                 try { client.Close(); } catch { }
+            }
+        }
+
+        // ---------- v3.3：端口冲突顺延后的「实际端口」采纳 ----------
+
+        // start-service.ps1 在配置端口被别的程序占用时会顺延到下一个空闲端口，
+        // 并把真正使用的端口写进 run/dsh-web.port。这里采纳它的三条前提（缺一不可）：
+        //   1. 文件内容是一个合法端口；
+        //   2. 该端口确实在监听；
+        //   3. 监听它的进程 PID 与 run/dsh-web.pid 一致 —— 也就是「这是我们自己的服务」。
+        // 第 3 条是关键：否则一次残留的端口文件会把面板指向别人的端口。
+        // 返回 true 表示端口发生了变化。
+        internal static bool SyncActivePort()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(PortFile) || !File.Exists(PortFile)) return false;
+                string txt = "";
+                try { txt = File.ReadAllText(PortFile).Trim(); } catch { return false; }
+                int p;
+                if (!int.TryParse(txt, out p) || p <= 0 || p > 65535) return false;
+                if (p == Port) return false;
+
+                int pid = ReadPid();
+                // v3.4：采纳端口**必须**有一个可验证的 pid。以前 pid 读不到时只要求「端口在监听」，
+                // 于是「残留 port 文件 + 别的程序占了那个端口」就能让面板把浏览器导航到别人的服务。
+                if (pid <= 0) return false;
+                if (FindPidByPort(p) != pid) return false;
+
+                int old = Port;
+                Port = p;
+                Url = "http://127.0.0.1:" + p;
+                LogEvent(LogKind.Warn, "服务实际端口为 " + p + "（配置端口 " + old + " 被占用，已自动顺延）");
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // ---------- v3.3：HTTP 健康检查（观测用，不触发重启） ----------
+
+        // 探 http://127.0.0.1:<port>/ ：能拿到非 5xx 应答就算健康。
+        // 明确绕过系统代理（req.Proxy = null）：本机回环不该走代理，用户跑 Clash 之类时尤其重要。
+        internal static void ProbeHealthIfDue(bool force)
+        {
+            if (!lastRunning) return;
+            long now = Environment.TickCount;
+            if (!force && healthProbedAt != 0 && now - healthProbedAt < 5000) return;
+            healthProbedAt = now;
+
+            int ms = -1;
+            try
+            {
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(Url + "/");
+                req.Method = "GET";
+                req.Proxy = null;
+                req.AllowAutoRedirect = false;
+                req.Timeout = 1500;
+                req.ReadWriteTimeout = 1500;
+                req.KeepAlive = false;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                {
+                    int code = (int)resp.StatusCode;
+                    if (code >= 200 && code < 500) ms = (int)(Environment.TickCount - now);
+                    try { resp.Close(); } catch { }
+                }
+            }
+            catch (WebException wex)
+            {
+                HttpWebResponse r = wex.Response as HttpWebResponse;
+                if (r != null)
+                {
+                    try { if ((int)r.StatusCode < 500) ms = (int)(Environment.TickCount - now); } catch { }
+                    try { r.Close(); } catch { }
+                }
+            }
+            catch { }
+
+            healthMs = ms;
+            if (ms < 0)
+            {
+                healthFailStreak++;
+                if (healthFailStreak == 3)
+                {
+                    LogEvent(LogKind.Warn, "健康检查连续 3 次无应答（端口仍在监听，不自动重启；长任务期间偶发属正常）");
+                }
+            }
+            else
+            {
+                if (healthFailStreak >= 3) LogEvent(LogKind.Success, "健康检查恢复正常 · " + ms + " ms");
+                healthFailStreak = 0;
+                if (serviceHealthySince == 0) serviceHealthySince = Environment.TickCount;
             }
         }
 
@@ -685,6 +1115,34 @@ namespace DshPanel
         {
             if (IsPortOpen()) return;
 
+            // ---- v3.4 快路径：node 冷启动约 0.1s，PowerShell 5.1 冷启动约 1.45s ----
+            // dsh-launch.mjs 只做「直连 bin.js」这一条最确定的路径，任何意外都**同步**转交
+            // start-service.ps1（试次阶梯/端口顺延/npx 兜底仍只存在于那份脚本里，
+            // 因此绝不会出现两套策略，也不会重复拉起服务）。
+            string nodeExe = FindNodeExe();
+            string launcher = Path.Combine(ScriptRoot, "dsh-launch.mjs");
+            if (nodeExe != null && File.Exists(launcher))
+            {
+                BootMark("launch: dsh-launch.mjs (node " + nodeExe + ")");
+                IntPtr fast = ShellExecuteW(IntPtr.Zero, "open", nodeExe,
+                    "\"" + launcher + "\"", ScriptRoot, 0);
+                if (fast.ToInt64() > 32) return;
+                BootMark("launcher ShellExecute failed (" + fast.ToInt64() + ") -> PowerShell fallback");
+                if (File.Exists(ErrLog))
+                {
+                    try
+                    {
+                        File.AppendAllText(ErrLog, "[start-service] dsh-launch.mjs could not be started (ShellExecute " +
+                            fast.ToInt64() + "); using start-service.ps1" + Environment.NewLine, new UTF8Encoding(false));
+                    }
+                    catch { }
+                }
+            }
+            else
+            {
+                BootMark("launcher unavailable (node=" + (nodeExe ?? "not found") + ") -> PowerShell fallback");
+            }
+
             string npxCli = FindNpxCli();
             if (!File.Exists(npxCli))
             {
@@ -748,6 +1206,7 @@ namespace DshPanel
                 LogEvent(LogKind.Warn, msg);
             }
             try { File.Delete(PidFile); } catch { }
+            try { File.Delete(PortFile); } catch { }
         }
 
         // 异步启动：立即返回 UI，ShellExecuteW 等耗时操作在后台执行
@@ -757,6 +1216,10 @@ namespace DshPanel
             opState = OpState.Starting;
             autoOpenPending = true;
             manualStop = false;
+            // v3.3：每次发起启动都重置健康基线，退避计数由「连续健康 120 秒」清零
+            serviceHealthySince = 0;
+            healthMs = -1;
+            healthFailStreak = 0;
             LogEvent(LogKind.Info, "启动服务…");
             ThreadPool.QueueUserWorkItem(delegate
             {
@@ -1116,6 +1579,7 @@ namespace DshPanel
 
         // v3.1：设置与 DSH 检测引导
         SmallButton btnSettings;     // 打开设置页
+        SmallButton btnWorkbench;    // v3.5：打开/收起工作台抽屉
         SettingsWindow settingsWindow; // 设置页（隐藏创建）
         Panel setupPanel;            // DSH 缺失时的提示引导页（覆盖网页区）
         RoundedButton btnSetupRecheck;
@@ -1133,6 +1597,7 @@ namespace DshPanel
 
         NotifyIcon notify;
         ContextMenuStrip trayMenu;
+        System.Threading.Timer updateTimer;   // v3.3：启动后延迟一次更新检查
         ToolStripMenuItem miToggle;
         ToolStripMenuItem miAutoRestart;
         ToolStripMenuItem miAutoStart;
@@ -1169,22 +1634,67 @@ namespace DshPanel
             Shown += delegate
             {
                 pollTimer = new System.Threading.Timer(PollTick, null, 0, 2000);
+                Program.BootMark("panel-shown");
                 Program.LogEvent(LogKind.Info, "面板已启动 · 端口 " + Program.Port + " · " + Program.Url);
                 Program.autoStartService = Program.GetPref("AutoStartService", true);
+                // v3.4.2：启动自检（后台、纯字节检查、只报告不阻塞）
+                Program.ScriptHealthCheckAsync();
                 EnsureWebViewAsync();
                 SyncWebView(Program.lastRunning);
-                // v3.1：先检测 DeepSeek Harness 是否可用——缺失则进入安装指引页，
-                // 就绪后才自动启动服务
+                // v3.2：启动与检测并行——服务启动不再等 check-dsh 完成。
+                // 用纯文件系统探测（毫秒级、不起任何进程）判断 dsh 是否就位：
+                // 就位就立刻起服务，check-dsh 的结果只用于决定是否显示安装指引页。
+                // 这样冷启动时「PowerShell + 两次 npm 探测」不再压在等待路径上。
+                if (Program.autoStartService && !Program.IsPortOpen())
+                {
+                    string binJs = Program.FindDshBinJs();
+                    if (binJs != null)
+                    {
+                        Program.BootMark("dsh-entry-found");
+                        MaybeAutoStartService();
+                    }
+                }
+                // v3.1：检测 DeepSeek Harness 是否可用——缺失则进入安装指引页
                 Program.CheckDshAsync(delegate(Program.DshCheckState st)
                 {
                     TryBeginInvoke(delegate { OnDshCheckResult(st); });
                 });
+                // v3.3：更新提示——延迟 12 秒再查，绝不和启动抢时间（只提示，不自动升级）
+                if (Program.updateCheckEnabled)
+                {
+                    updateTimer = new System.Threading.Timer(delegate(object st)
+                    {
+                        try { if (updateTimer != null) updateTimer.Dispose(); } catch { }
+                        Program.CheckUpdateAsync(delegate(string summary)
+                        {
+                            if (string.IsNullOrEmpty(summary)) return;
+                            bool hasUpdate = summary.IndexOf("有新版本") >= 0;
+                            Program.LogEvent(hasUpdate ? LogKind.Warn : LogKind.Info, summary);
+                            if (hasUpdate)
+                            {
+                                TryBeginInvoke(delegate
+                                {
+                                    try
+                                    {
+                                        if (notify != null)
+                                        {
+                                            notify.ShowBalloonTip(5000, "DeepSeek Harness 有新版本",
+                                                summary + "\r\n升级方式见 check-update.ps1 的输出（不会自动升级）", ToolTipIcon.Info);
+                                        }
+                                    }
+                                    catch { }
+                                });
+                            }
+                        });
+                    }, null, 12000, System.Threading.Timeout.Infinite);
+                }
             };
             FormClosing += OnFormClosing;
             FormClosed += delegate
             {
                 closed = true;
                 if (pollTimer != null) pollTimer.Dispose();
+                try { if (updateTimer != null) { updateTimer.Dispose(); updateTimer = null; } } catch { }
                 if (notify != null)
                 {
                     notify.Visible = false;
@@ -1196,6 +1706,7 @@ namespace DshPanel
                     lastTrayIcon.Dispose();
                     lastTrayIcon = null;
                 }
+                try { Wb.Shutdown(); } catch { }
                 if (webView != null)
                 {
                     try { webView.Dispose(); } catch { }
@@ -1480,12 +1991,13 @@ namespace DshPanel
             // ---- 顶栏：Header（左）+ 状态胶囊 + 设置（右） ----
             TableLayoutPanel topRow = new TableLayoutPanel();
             topRow.Dock = DockStyle.Fill;
-            topRow.ColumnCount = 3;
+            topRow.ColumnCount = 4;
             topRow.RowCount = 1;
             topRow.BackColor = Theme.Card;
             topRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118)); // 状态胶囊
+            topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));  // v3.5：工作台
             topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));  // 设置按钮
 
             // 左侧：Logo + 标题 + URL
@@ -1515,6 +2027,16 @@ namespace DshPanel
                 }
             };
 
+            // v3.5：工作台入口（文件 / 终端 / 任务 / 变更 / Git）
+            btnWorkbench = new SmallButton("工作台");
+            btnWorkbench.Dock = DockStyle.Fill;
+            btnWorkbench.Margin = new Padding(2, 6, 2, 6);
+            btnWorkbench.Click += delegate
+            {
+                try { Wb.ToggleUi(); }
+                catch (Exception ex) { Program.LogEvent(LogKind.Warn, "打开工作台失败：" + ex.Message); }
+            };
+
             // 设置按钮：打开设置页（含关于、偏好开关、DSH 状态与重新检测）
             btnSettings = new SmallButton("设置");
             btnSettings.Dock = DockStyle.Fill;
@@ -1523,7 +2045,8 @@ namespace DshPanel
 
             topRow.Controls.Add(header, 0, 0);
             topRow.Controls.Add(statusCapsule, 1, 0);
-            topRow.Controls.Add(btnSettings, 2, 0);
+            topRow.Controls.Add(btnWorkbench, 2, 0);
+            topRow.Controls.Add(btnSettings, 3, 0);
 
             layout.Controls.Add(topRow, 0, 0);
 
@@ -1578,26 +2101,43 @@ namespace DshPanel
 
         // ---------- v3.1：DSH 安装引导 ----------
 
-        // 检测回调（UI 线程）：已就绪 → 关闭引导页并自动启动服务；缺失/超时 → 引导页提示
+        // 检测回调（UI 线程）：已就绪 → 自动启动服务（v3.2 起通常已在启动中）；缺失/超时 → 引导页
         void OnDshCheckResult(Program.DshCheckState state)
         {
             dshChecked = true;
             dshState = state;
             dshInstalled = state == Program.DshCheckState.Installed;
+            Program.BootMark("dsh-check: " + state);
             if (state == Program.DshCheckState.Installed)
             {
                 Program.LogEvent(LogKind.Success, "DeepSeek Harness 已就绪");
                 setupPanel.Visible = false;
                 try { webView.Visible = true; } catch { }
+                // v3.2：服务可能已经由文件系统探测先行启动；StartServiceAsync 自带幂等
+                // 与端口检查，这里再调一次只作为「检测晚于探测」的兜底。
                 MaybeAutoStartService();
             }
             else if (state == Program.DshCheckState.Missing)
             {
+                // 端口已经在监听说明服务确实在跑（探测有结果、检测结论可疑）——
+                // 此时不要用引导页盖住正在工作的界面。
+                if (Program.IsPortOpen())
+                {
+                    Program.LogEvent(LogKind.Warn, "检测未找到 @deepseek-ai/dsh，但服务已在运行，继续使用当前服务");
+                    setupPanel.Visible = false;
+                    try { webView.Visible = true; } catch { }
+                    return;
+                }
                 Program.LogEvent(LogKind.Warn, "未检测到 DeepSeek Harness，进入安装指引页");
                 ShowSetupPanel();
             }
             else
             {
+                if (Program.IsPortOpen())
+                {
+                    Program.LogEvent(LogKind.Warn, "检测超时，但服务已在运行，继续使用当前服务");
+                    return;
+                }
                 Program.LogEvent(LogKind.Warn, "DeepSeek Harness 检测超时，请检查 Node.js 环境");
                 ShowSetupPanel();
                 setupStatus.Text = "检测超时：无法确认 DeepSeek Harness 状态，请检查 Node.js 后重新检测。";
@@ -1736,11 +2276,20 @@ namespace DshPanel
                 // 用户数据目录放 run/（与运行时产物一致）；失败则退回默认目录
                 string dataDir = Path.Combine(Program.ScriptRoot, "run", "webview2-data");
                 CoreWebView2Environment env = null;
-                try { env = await CoreWebView2Environment.CreateAsync(null, dataDir); } catch { }
-                if (env == null) env = await CoreWebView2Environment.CreateAsync(null, null);
+                CoreWebView2EnvironmentOptions envOpts = null;
+                if (Program.debugPort > 0)
+                {
+                    envOpts = new CoreWebView2EnvironmentOptions("--remote-debugging-port=" + Program.debugPort);
+                    Program.LogEvent(LogKind.Warn, "内嵌浏览器调试端口已开启：" + Program.debugPort + "（仅调试用）");
+                }
+                try { env = await CoreWebView2Environment.CreateAsync(null, dataDir, envOpts); } catch { }
+                if (env == null) env = await CoreWebView2Environment.CreateAsync(null, null, envOpts);
                 await webView.EnsureCoreWebView2Async(env);
                 webViewInited = true;
+                Program.BootMark("webview2-ready");
                 Program.LogEvent(LogKind.Info, "内嵌浏览器已就绪（WebView2）");
+                // v3.5：工作台（注入式抽屉 + 桥接 + 会话边车）
+                try { await Wb.AttachAsync(this, webView); } catch (Exception wex) { Program.LogEvent(LogKind.Warn, "工作台初始化失败：" + wex.Message); }
                 SyncWebView(Program.lastRunning);
             }
             catch (Exception ex)
@@ -1788,6 +2337,7 @@ namespace DshPanel
                     {
                         webShowsApp = true;
                         webPlaceholderKind = null;
+                        Program.BootMark("navigate: " + Program.Url);
                         webView.CoreWebView2.Navigate(Program.Url);
                     }
                 }
@@ -1830,8 +2380,15 @@ namespace DshPanel
             if (Interlocked.Exchange(ref pollBusy, 1) != 0) return;
             try
             {
+                // v3.3：端口冲突顺延后，先尝试采纳 run/dsh-web.port 里的真实端口
+                // （需通过「监听进程 PID == pid 文件」校验），再判断服务是否在跑。
+                if (Program.SyncActivePort())
+                {
+                    TryBeginInvoke(delegate { RefreshEndpointUi(); });
+                }
                 bool running = Program.IsPortOpen();
                 Program.lastRunning = running;
+                Program.ProbeHealthIfDue(false);
 
                 // 运行时长起点：首次检测到运行 / 停止后清零
                 if (running)
@@ -1852,19 +2409,22 @@ namespace DshPanel
                     Program.serviceUpSince = 0;
                 }
 
-                // ---- 崩溃自动恢复（默认关闭；托盘菜单开启） ----
+                // ---- v3.3：崩溃自动恢复（默认关闭；托盘菜单开启）+ 指数退避 ----
+                // 触发条件只看端口（进程是否还活着）；健康检查失败不触发重启，
+                // 因为长任务期间 HTTP 短暂无应答是正常的，重启会打断用户的工作。
                 if (Program.opState == Program.OpState.Idle && Program.autoRestartEnabled && !Program.manualStop)
                 {
                     if (Program.everRan && lastPollRunning && !running)
                     {
                         long now = Environment.TickCount;
-                        if (now - Program.lastRestartTick >= 60000)
+                        int backoffMs = Program.RestartBackoffMs(Program.autoRestartCount);
+                        if (now - Program.lastRestartTick >= backoffMs)
                         {
-                            if (Program.autoRestartCount >= 3)
+                            if (Program.autoRestartCount >= Program.RestartBackoffSeconds.Length)
                             {
                                 Program.autoRestartEnabled = false;
                                 Program.autoRestartCount = 0;
-                                Program.LogEvent(LogKind.Error, "服务多次自动恢复失败，自动恢复已停用");
+                                Program.LogEvent(LogKind.Error, "自动恢复已连续失败 " + Program.RestartBackoffSeconds.Length + " 次，已停用。请检查日志后手动启动");
                                 TryBeginInvoke(delegate
                                 {
                                     try { if (notify != null) notify.ShowBalloonTip(3000, "dsh-panel", "服务多次自动恢复失败，已停止自动恢复。请手动检查。", ToolTipIcon.Warning); } catch { }
@@ -1874,15 +2434,28 @@ namespace DshPanel
                             {
                                 Program.lastRestartTick = now;
                                 Program.autoRestartCount++;
-                                Program.LogEvent(LogKind.Warn, "检测到服务异常退出，正在自动恢复…");
+                                Program.LogEvent(LogKind.Warn, "检测到服务异常退出，正在自动恢复（第 " +
+                                    Program.autoRestartCount + "/" + Program.RestartBackoffSeconds.Length + " 次）…");
                                 Program.StartServiceAsync();
                             }
                         }
                     }
                 }
-                if (running && Program.autoRestartCount > 0 && Environment.TickCount - Program.lastRestartTick > 20000)
+                // 退避计数只有在「连续健康满 120 秒」后才清零：
+                // 否则「刚起来又挂」会被误判为恢复成功，退避形同虚设。
+                if (running)
                 {
-                    Program.autoRestartCount = 0;
+                    if (Program.serviceHealthySince == 0) Program.serviceHealthySince = Environment.TickCount;
+                    else if (Program.autoRestartCount > 0 &&
+                             Environment.TickCount - Program.serviceHealthySince >= 120000)
+                    {
+                        Program.LogEvent(LogKind.Info, "服务已稳定运行 2 分钟，自动恢复计数归零");
+                        Program.autoRestartCount = 0;
+                    }
+                }
+                else
+                {
+                    Program.serviceHealthySince = 0;
                 }
                 lastPollRunning = running;
 
@@ -1933,6 +2506,7 @@ namespace DshPanel
                 if (running && Program.autoOpenPending)
                 {
                     Program.autoOpenPending = false;
+                    Program.BootMark("port-ready");
                     Program.LogEvent(LogKind.Success, "服务已就绪 · " + Program.Url);
                     if (webViewFailed)
                     {
@@ -1989,6 +2563,17 @@ namespace DshPanel
             finally
             {
                 Interlocked.Exchange(ref pollBusy, 0);
+                // v3.2：过渡期（启动/停止）把轮询收紧到 300ms——就绪后页面最多早 1.7s
+                // 出现；空闲态回到 2s，不额外唤醒 CPU。
+                try
+                {
+                    if (pollTimer != null)
+                    {
+                        int period = Program.opState == Program.OpState.Idle ? 2000 : 300;
+                        pollTimer.Change(period, period);
+                    }
+                }
+                catch { }
             }
         }
 
@@ -2005,8 +2590,21 @@ namespace DshPanel
             {
                 s = "服务未运行";
             }
+            // v3.3：健康检查（HTTP / 应答耗时）；连续无应答只提示，不重启
+            if (running)
+            {
+                if (Program.healthMs >= 0) s += " · 健康 " + Program.healthMs + "ms";
+                else if (Program.healthFailStreak > 0) s += " · 健康检查无应答×" + Program.healthFailStreak;
+            }
             s += " · 日志 " + FormatSize(GetLogBytes());
             return s;
+        }
+
+        // v3.3：端点（端口 / URL）变化后刷新顶栏与胶囊提示
+        void RefreshEndpointUi()
+        {
+            try { if (header != null) header.SetUrl(Program.Url); } catch { }
+            try { if (capsuleTip != null && statusCapsule != null) capsuleTip.SetToolTip(statusCapsule, "端口 " + Program.Port); } catch { }
         }
 
         long GetLogBytes()
@@ -2390,8 +2988,9 @@ namespace DshPanel
                     })
             }));
             body.Controls.Add(MakeSection("服务", new Control[] {
-                MakeInfoRow("监听端口", Program.Port + "（dsh-web.config）"),
+                MakeInfoRow("监听端口", Program.Port + "（dsh-web.config；端口被占用时自动顺延）"),
                 MakeDshStatusRow(),
+                MakeInfoRow("远程访问", "默认关闭 · 需要时运行 start-remote.cmd（令牌鉴权，关闭窗口即收回）"),
                 MakeButtonRow(new string[] { "打开日志窗口", "打开日志目录", "打开系统浏览器", "清除浏览器缓存" })
             }));
             body.Controls.Add(MakeSection("关于", new Control[] {

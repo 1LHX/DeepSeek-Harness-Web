@@ -6,6 +6,11 @@ run/
 *.log
 *.pid
 
+# ---- workbench transients (v3.5) ----
+# 写文件时的临时副本（写到一半崩溃会留下）与冒烟脚本的临时文件
+*.wb-tmp
+wb-scratch-*.txt
+
 # ---- WebView2 runtime DLLs next to the exe (build copies them from lib/) ----
 /Microsoft.Web.WebView2.Core.dll
 /Microsoft.Web.WebView2.WinForms.dll

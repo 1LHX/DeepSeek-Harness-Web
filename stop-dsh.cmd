@@ -2,9 +2,13 @@
 rem stop-dsh.cmd - stop the DeepSeek Harness Web service
 rem Usage:  stop-dsh.cmd [--dry-run]
 rem   --dry-run : preview which processes would be killed, without killing anything
+rem
+rem v3.3: the service may have moved to another port when the configured one was taken
+rem (see run/dsh-web.port). That recorded port is preferred over dsh-web.config here.
 setlocal
 set "DIR=%~dp0"
 set "PIDFILE=%DIR%run\dsh-web.pid"
+set "PORTFILE=%DIR%run\dsh-web.port"
 set "PORT=3080"
 set "DRYRUN="
 if /i "%~1"=="--dry-run" set "DRYRUN=1"
@@ -18,6 +22,9 @@ if exist "%DIR%dsh-web.config" (
         if /i "%%A"=="port" set "PORT=%%B"
     )
 )
+
+rem Recorded actual port (port-conflict fallback) wins when present
+if exist "%PORTFILE%" set /p PORT=<"%PORTFILE%"
 
 set "KILLED="
 set "PID="
@@ -40,7 +47,7 @@ if defined PID (
     )
 )
 
-rem 2) Fallback: kill the listener on the configured port (exact match ":3080 ")
+rem 2) Fallback: kill the listener on the active port (exact match ":3080 ")
 rem    - ":3080 " with trailing space avoids matching :30800 etc.
 if not defined KILLED (
     for /f "tokens=5" %%P in ('netstat -ano ^| findstr /C:":%PORT% " ^| findstr "LISTENING"') do (
@@ -63,6 +70,7 @@ if defined DRYRUN (
     )
     exit /b 0
 )
+if not defined DRYRUN del "%PORTFILE%" >nul 2>&1
 if defined KILLED (
     echo [dsh-web] Stopped.
 ) else (
