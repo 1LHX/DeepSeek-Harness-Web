@@ -1,6 +1,23 @@
-# Keep blobs explicit about text vs binary so a clone on another machine behaves the same.
-# Text files: let git decide by content (no eol forcing -> no renormalization churn).
+# Line endings are pinned per file type so a fresh clone produces byte-identical inputs.
+# This project has a long history of "looks fine, breaks at runtime" encoding bugs
+# (a BOM-less .ps1, a non-ASCII .cmd, a mangled </div> in ui.html) - keeping the bytes
+# deterministic across machines removes one whole class of "works on my machine".
+#
+#  * ps1/cmd/cs: Windows toolchain + PowerShell 5.1 favour CRLF
+#  * mjs/html/json: shipped as-is to node/browser, LF keeps the embedded resource stable
 * text=auto
+
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.cs   text eol=crlf
+*.mjs  text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.config text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
 
 # Distribution artifacts must never be line-ending converted.
 *.exe binary
