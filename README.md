@@ -61,8 +61,8 @@ v3.5 起顶栏多一个「工作台」（快捷键 F2）：文件、终端、任
 | `Microsoft.Web.WebView2.*.dll`、`WebView2Loader.dll`（根目录副本） | 构建产物：从 `lib/` 复制到 exe 旁（CLR 只在 exe 目录找），`.gitignore` 忽略 |
 | **工作台（v3.5）** | |
 | `workbench/ui.html` | 工作台界面（单文件 HTML+CSS+JS，构建时内嵌进 exe，运行时注入 DSH 页面） |
-| `workbench/session-reader.mjs` | 会话事件流边车：解 zstd 帧、从会话日志里抽 todo/write、goal/change、tool/call（任务看板的数据源；缺失时其余页签照常用） |
-| `workbench/smoke.mjs` | 工作台自动化冒烟（CDP 驱动：挂载/桥接/五页签/终端/编辑-应用-回滚，17 项；需临时打开 `debugport`） |
+| `workbench/session-reader.mjs` | 会话事件流边车：解 zstd 帧、抽轮次卡（turn/start|end + tool/call）、todo 清单、排队消息（任务看板的数据源；缺失时其余页签照常用） |
+| `workbench/smoke.mjs` | 工作台自动化冒烟（CDP 驱动：挂载/桥接/五页签/轮次卡/抽屉宽度/终端策略/编辑-应用-回滚，20 项；需临时打开 `debugport`） |
 | **构建与测试** | |
 | `build-dsh-panel.cmd` | 编译脚本（csc /optimize+，引用 lib/ 的 WebView2 SDK，内嵌 `workbench/ui.html`，自动复制 loader） |
 | `apply-panel-update.cmd` | 改完 `.cs` 后一键「门禁 → 关面板 → 重编译 → 重开」（服务不停） |
@@ -151,7 +151,7 @@ run-tests.cmd    # 门禁 + 编译 + 面板 GUI 冒烟（不触碰正在运行�
 
 ```bat
 :: 1) 先在 dsh-web.config 里临时打开 debugport=9222，重启面板
-node workbench\smoke.mjs        :: 17 项：挂载 / 桥接 / 五页签 / 终端策略 / 编辑-应用-回滚 / Git
+node workbench\smoke.mjs        :: 20 项：挂载 / 桥接 / 五页签 / 轮次卡 / 抽屉宽度 / 终端策略 / 编辑-应用-回滚 / Git
 :: 2) 验完把 debugport 注释掉，再重启面板
 ```
 
@@ -356,15 +356,17 @@ stop-dsh.cmd --dry-run  # 预览将要终止的进程，不实际执行
 - 单实例互斥：重复启动会激活已有窗口
 - 启动失败 / 停止超时会写 err.log 并弹托盘气泡
 
-## 工作台（v3.5）
+## 工作台（v3.5 起；v3.6 加轮次卡与可调宽度）
 
-顶栏「工作台」按钮（或页面里按 **F2**）拉起一个右侧抽屉，五个页签：
+顶栏「工作台」按钮（或页面里按 **F2**）拉起一个右侧抽屉，五个页签。
+**抽屉宽度可以拖左边沿自由调整**（双击把手复位，宽度记在 localStorage），
+遮罩只做视觉提示、不拦点击——开着工作台也能继续操作 DSH 页面，关闭走 ✕ / Esc / F2。
 
 | 页签 | 能干什么 | 实现要点 |
 |---|---|---|
 | 文件 | 懒加载目录树、文件名搜索、按内容搜索、文本/图片预览、复制路径、**@ 引用直接插进 DSH 输入框** | 全部走桥接，路径一律锁在工作区根目录内 |
 | 终端 | PowerShell 5.1 / cmd 执行命令、实时输出、命令历史（↑↓）、停止、cwd 跟随 | **命令白名单 + 危险命令二次确认**在 C# 侧判定（不在 JS 里） |
-| 任务 | 目标 + 三列看板（待规划 / 进行中 / 已完成）+ 会话活动流 | **直接读 DSH 会话事件流**里的 `todo/write`、`goal/change`、`tool/call` |
+| 任务 | 目标条 + 三列看板（待规划 / 进行中 / 已完成）+ 会话活动流；**每轮对话自动生成一张轮次卡**，Agent 自己维护的清单与排队消息叠在上面 | **直接读 DSH 会话事件流**里的 `todo/write`、`goal/change`、`tool/call` |
 | 变更 | 基线快照对比：修改/新增/删除清单、行级 diff、接受 / 回滚 / 编辑并预览后 Apply / 重设基线 | 基线存在 `run/workbench/baseline/`，只收文本文件（≤512KB） |
 | Git | 当前分支、HEAD、暂存/未暂存/未跟踪计数、最近提交、单文件 diff | 只读，不改仓库状态 |
 
@@ -373,17 +375,20 @@ stop-dsh.cmd --dry-run  # 预览将要终止的进程，不实际执行
 DSH 把每一次会话事件追加进
 `%USERPROFILE%\.dsh\sessions\<编码后的cwd>\session-<id>\session.jsonl.zstd`——注意它是**一串独立的
 zstd 帧**（每次追加一个新帧，Node 的 `zstdDecompressSync` 只解第一帧）。`workbench/session-reader.mjs` 按魔数
-切帧、逐帧解压，把这几类记录翻成看板事件：
+切帧、逐帧解压，把这几类记录翻成看板：
+
+**为什么不再只认 `todo_write`**：v3.5 的看板只读 Agent 的清单，实测踩过——Agent 某一轮不写清单时
+「待规划 / 进行中」永远是空的，看起来像看板坏了。v3.6 起骨架是**轮次卡**（一定会有的东西）：
 
 | 会话记录 | 工作台怎么用 |
 |---|---|
-| `todo/write` | 现成的任务清单（含 pending / in_progress / completed），直接映射三列 |
-| `goal/change` | 顶部「目标」条 |
-| `session/title` | 会话标题（没有目标时兜底） |
-| `tool/call` / `tool/result` | 活动流：Agent 在跑什么命令、读改哪个文件、成没成 |
-| `turn/start` / `turn/end` | Agent 是「工作中」还是「空闲」（底部状态点） |
+| `turn/start` / `turn/end` | 轮次卡：一轮一张。目标是你在 DSH 里发的那句话，卡上带「第几轮 / 工具数 / 用时 / 最近 3 个工具」；跑着的是「进行中」，结束的落「已完成」 |
+| `todo/write` | Agent **自己维护**的清单（pending / in_progress / completed），叠在轮次卡之上；超过 2 分钟没更新会提示「清单已过期，以轮次卡为准」 |
+| `agent/inbox/spliced` | 排队到下一轮的消息（插件注入的通知不算）落「待规划」 |
+| `tool/call` / `tool/result` | 卡片里的工具条目 + 下方活动流：在跑什么命令、读改哪个文件、成没成 |
+| `goal/change` / `session/title` | 没有轮次目标时的目标条 / 会话标题兜底 |
 
-所以这里没有「猜」。看板显示的就是 Agent 真写下的清单；活动流就是它真调用的工具。
+所以这里没有「猜」：轮次卡来自真实的 `turn/start|end`，卡里的工具来自真实的 `tool/call`。
 边车由面板启动（`node workbench/session-reader.mjs --cwd <工作区>`），只用 Node 内置能力、零依赖；
 面板退出时它的 stdin 关闭，边车自己退出。
 
@@ -481,6 +486,7 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 | v3.2 | 启动提速：start-service 直连 node bin.js（npx 兜底）+ 启动分段打点 + 试次阶梯与失败现场保留；`--port` 显式传递（修掉 config 端口不生效的隐患）；面板启动与依赖检测并行、过渡期 300ms 轮询；可选 V8 编译缓存钩子（实测无收益，默认关）；新增 defender-exclusions / clean-npx-cache / check-boot-perf / apply-panel-update |
 | v3.3 | 可靠性：端口冲突自动顺延 + 面板按 PID 校验采纳真实端口 + 重复启动直接复用；崩溃自动恢复改指数退避（5→300 秒）并以「连续健康 120 秒」复位；HTTP 健康检查（绕过代理，仅观测不重启）；日志被占用时自动改名；stop-dsh/check-boot-perf 跟随实际端口；新增更新提示（check-update.ps1，只提示不自动升级）与令牌鉴权的远程访问（start-remote.cmd + remote-proxy.mjs，HTTP+WebSocket 透传，默认关闭） |
 | v3.4.1 | 端口采纳收紧：`SyncActivePort` 现在**必须**有可验证的 pid 才采纳 `run/dsh-web.port`（此前 pid 读不到时只要求端口在监听，「残留 port 文件 + 别的程序占了该端口」会让内嵌浏览器导航到别人的服务）；pid 文件失效时一并删除端口记录。新增 `check-scripts.ps1` 编码/语法门禁并接入 `run-tests.cmd` 第一步 |
+| v3.6 | **工作台二轮**：任务看板改成「轮次卡」骨架（每轮对话一张卡，目标取你的消息，带工具数/用时/最近工具），Agent 的 todo 清单与排队消息叠在上面，修掉「待规划 / 进行中永远为空」；清单超 2 分钟未更新时提示以轮次卡为准；抽屉**宽度可拖拽**（双击复位、localStorage 记忆）、遮罩不再拦点击；修掉页签徽章用错根节点导致一直不更新的问题；冒烟扩到 20 项 |
 | v3.5 | **工作台**：顶栏「工作台」+ 抽屉界面（`workbench/ui.html`，Shadow DOM 注入 DSH 页面，F2）：文件树/预览/搜索 + **@ 引用直接插入 DSH 输入框**、内嵌终端（PowerShell/cmd，命令白名单 + 危险命令二次确认 + 输出上限 + cwd 跟随 + 停止）、**任务看板**（会话事件流边车 `session-reader.mjs` 解 zstd 帧读 `todo/write`/`goal/change`/`tool/call`，三列 + 活动流）、变更审阅（基线快照 + 行级 diff + 接受/回滚/预览后 Apply）、Git 视图（分支/提交/未提交变更/diff）。桥接集中在 `dsh-workbench.cs`（唯一允许起进程的地方，路径锁工作区、策略在 C# 侧）；构建内嵌 UI 资源；门禁新增 ui.html 分节标记/UTF-8 与 exe 内嵌资源检查；可选 `debugport` 供 CDP 巡检 |
 | v3.4.2 | 门禁加固：`-Fast` 模式、空转保护（`-MinFiles`）、源码/exe 版本一致性、PS 5.1 缺失时的显式降级告警；`apply-panel-update.cmd` 在**关面板之前**先跑门禁；面板新增启动自检（纯 .NET 字节检查，`run/boot-timing.log` 记 `selfcheck:`）——即使没人跑门禁，编码/版本问题也会当场上报 |
 

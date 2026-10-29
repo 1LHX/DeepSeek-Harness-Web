@@ -61,6 +61,10 @@
 //         任务（直接读 DSH 会话事件流的 todo/write 与 goal/change，边车 workbench/session-reader.mjs）、
 //         变更（工作区基线快照 + 行级 diff + 接受/回滚/预览后 Apply）、Git（分支/提交/未提交变更）。
 //       桥接实现集中在 dsh-workbench.cs（本文件只做接线与顶栏入口）。
+// v3.6（工作台二轮）：任务看板改成「轮次卡」骨架——每轮对话一张卡（进行中/已完成，
+//       目标取你在 DSH 里发的那句话，卡片上带工具数与最近工具），Agent 自己维护的
+//       todo 清单与排队消息叠在上面，所以不再出现「待规划/进行中永远为空」；
+//       抽屉宽度可拖拽（双击复位、记住上次值），遮罩不再拦点击，开着抽屉也能用页面。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -84,8 +88,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.5.0.0")]
-[assembly: AssemblyFileVersion("3.5.0.0")]
+[assembly: AssemblyVersion("3.6.0.0")]
+[assembly: AssemblyFileVersion("3.6.0.0")]
 
 namespace DshPanel
 {

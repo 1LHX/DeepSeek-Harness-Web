@@ -36,7 +36,7 @@ namespace DshPanel
 {
 internal static class Wb
 {
-    internal const string Version = "3.5.0";
+    internal const string Version = "3.6.0";
 
     // ---------- 上限（都要有，否则一次误操作就能把面板拖死） ----------
     const int MaxTextRead = 2 * 1024 * 1024;        // 文本预览上限
@@ -1883,6 +1883,8 @@ internal static class Wb
     static string agentTitle = "";
     static string agentSession = "";
     static string agentNote = "";
+    // v3.6：看板卡片数据（轮次卡 / 排队消息 / 清单时间戳），由会话边车整包推送
+    static Dictionary<string, object> agentBoard;
 
     // 边车脚本：v3.5 收进 workbench/（与 ui.html 放一起），老布局留在根目录的也认
     static string SidecarScript()
@@ -1906,6 +1908,7 @@ internal static class Wb
         {
             agentGoal = null;
             agentTodos = null;
+            agentBoard = null;
             agentEvents.Clear();
             agentState = "unknown";
             agentTitle = "";
@@ -2011,6 +2014,7 @@ internal static class Wb
                 agentTitle = "";
                 agentGoal = null;
                 agentTodos = null;
+                agentBoard = null;
                 agentEvents.Clear();
                 agentState = "idle";
             }
@@ -2025,6 +2029,7 @@ internal static class Wb
             {
                 agentGoal = m.ContainsKey("goal") ? m["goal"] as Dictionary<string, object> : null;
                 agentTodos = m.ContainsKey("todos") ? ToList(m["todos"]) : null;
+                agentBoard = BoardFromSnapshot(m);
                 agentTitle = S(m, "title");
                 agentState = S(m, "state");
                 object evs;
@@ -2051,6 +2056,7 @@ internal static class Wb
                 else if (kind == "goal") agentGoal = ObjWith("objective", S(ev, "objective"));
                 else if (kind == "title") agentTitle = S(ev, "title");
                 else if (kind == "turn") agentState = S(ev, "state");
+                else if (kind == "board") agentBoard = ev.ContainsKey("board") ? ev["board"] as Dictionary<string, object> : null;
                 agentEvents.Add(ev);
                 TrimEvents();
             }
@@ -2078,6 +2084,21 @@ internal static class Wb
         return list;
     }
 
+    // snapshot 里的看板字段是平铺的；挑出来当初始看板（之后走 kind=board 增量整包替换）
+    static Dictionary<string, object> BoardFromSnapshot(Dictionary<string, object> m)
+    {
+        Dictionary<string, object> b = Obj();
+        b["turns"] = m.ContainsKey("turns") ? m["turns"] : null;
+        b["current"] = m.ContainsKey("current") ? m["current"] : null;
+        b["inbox"] = m.ContainsKey("inbox") ? m["inbox"] : null;
+        b["todosAt"] = m.ContainsKey("todosAt") ? m["todosAt"] : (object)0;
+        b["lastActivityAt"] = m.ContainsKey("lastActivityAt") ? m["lastActivityAt"] : (object)0;
+        Dictionary<string, object> g = m.ContainsKey("goal") ? m["goal"] as Dictionary<string, object> : null;
+        b["goal"] = g == null ? "" : S(g, "objective");
+        b["title"] = S(m, "title");
+        return b;
+    }
+
     static void TrimEvents()
     {
         while (agentEvents.Count > MaxAgentEvents) agentEvents.RemoveAt(0);
@@ -2093,6 +2114,7 @@ internal static class Wb
             d["sessionId"] = agentSession;
             d["goal"] = agentGoal;
             d["todos"] = agentTodos;
+            d["board"] = agentBoard;
             d["note"] = agentNote;
             List<object> tail = agentEvents.Count > 120 ? agentEvents.GetRange(agentEvents.Count - 120, 120) : new List<object>(agentEvents);
             d["events"] = tail;

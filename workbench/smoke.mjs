@@ -42,7 +42,11 @@ ws.addEventListener('message', (ev) => {
   let m = null;
   try { m = JSON.parse(ev.data); } catch (e) { return; }
   if (m.id && waiters.has(m.id)) { waiters.get(m.id)(m); waiters.delete(m.id); return; }
-  if (m.method === 'Runtime.exceptionThrown') { pageErrors.push(String(m.params.exceptionDetails.text)); }
+  if (m.method === 'Runtime.exceptionThrown') {
+    const d = m.params.exceptionDetails || {};
+    const desc = (d.exception && (d.exception.description || d.exception.value)) || d.text || 'unknown';
+    pageErrors.push(String(desc).split(String.fromCharCode(10))[0]);
+  }
 });
 const send = (method, params) => {
   const id = ++seq;
@@ -134,6 +138,16 @@ await sleep(1500);
 const tasks = await ev('(function(){var s=' + SR + ';var c={};["pending","in_progress","completed"].forEach(function(k){c[k]=s.querySelectorAll("[data-cards="+k+"] .wb-card").length;});return {cards:c, events:s.querySelectorAll("#wb-events .wb-ev").length, goal:s.getElementById("wb-goal-text").textContent.slice(0,40)};})()');
 const cardTotal = tasks && tasks.cards ? tasks.cards.pending + tasks.cards.in_progress + tasks.cards.completed : 0;
 check('任务看板读到清单/活动', cardTotal > 0 || (tasks && tasks.events > 0), tasks ? (cardTotal + ' 张卡 · ' + tasks.events + ' 条活动 · 目标：' + tasks.goal) : 'no-data');
+const turnCards = await ev('(function(){var s=' + SR + ';return s.querySelectorAll(".wb-card-turn").length;})()');
+check('任务看板有轮次卡（不依赖 Agent 写清单）', turnCards > 0, turnCards + ' 张轮次卡');
+
+// 5b) 抽屉宽度可拖拽（模拟 pointer 事件）+ 双击复位
+const widthTest = await ev('(function(){var s=' + SR + ';var r=s.getElementById("wb-resizer");var d=s.querySelector(".wb-drawer");var target=620;var x=window.innerWidth-target;r.dispatchEvent(new PointerEvent("pointerdown",{pointerId:1,clientX:window.innerWidth-800,bubbles:true,cancelable:true}));r.dispatchEvent(new PointerEvent("pointermove",{pointerId:1,clientX:x,bubbles:true}));r.dispatchEvent(new PointerEvent("pointerup",{pointerId:1,clientX:x,bubbles:true}));var w=Math.round(d.getBoundingClientRect().width);var saved=null;try{saved=localStorage.getItem("dsh-workbench-width");}catch(e){}return {width:w,target:target,saved:saved};})()');
+check('抽屉宽度可拖拽并记住', widthTest && Math.abs(widthTest.width - widthTest.target) <= 24 && String(widthTest.saved) === String(widthTest.width), JSON.stringify(widthTest));
+await ev('(function(){var s=' + SR + ';s.getElementById("wb-resizer").dispatchEvent(new MouseEvent("dblclick",{bubbles:true}));return "reset";})()');
+await sleep(200);
+const afterReset = await ev('(function(){var s=' + SR + ';var saved=null;try{saved=localStorage.getItem("dsh-workbench-width");}catch(e){}return {saved:saved,width:Math.round(s.querySelector(".wb-drawer").getBoundingClientRect().width)};})()');
+check('双击复位回默认宽度', afterReset && afterReset.saved === null, JSON.stringify(afterReset));
 
 // 5) 变更审阅：写临时文件 -> 出现在清单 -> 点开 -> 编辑 -> 应用 -> 回滚
 const saved = await ev('__smokeCall("fs.save",{path:"' + SCRATCH + '",text:"alpha" + ' + LF + ' + "beta" + ' + LF + '}).then(function(m){return m.ok?"ok":m.error;})');
