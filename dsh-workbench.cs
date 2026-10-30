@@ -36,7 +36,7 @@ namespace DshPanel
 {
 internal static class Wb
 {
-    internal const string Version = "3.7.0";
+    internal const string Version = "3.7.1";
 
     // ---------- 上限（都要有，否则一次误操作就能把面板拖死） ----------
     const int MaxTextRead = 2 * 1024 * 1024;        // 文本预览上限

@@ -69,6 +69,10 @@
 //       顶栏白底 + 蓝色品牌标 + URL 浅蓝 chip；状态胶囊改成「浅底 + 同色深字 + 实心点」
 //       （不再大块饱和填充）；按钮/开关/卡片/输入框统一圆角与边框；日志与设置页沿用同一套 token；
 //       占位页与工作台同步换色；应用图标 / 托盘图标 / Logo 共用同一枚「›_」标记（圆头线段，无尖角）。
+// v3.7.1（修复）：设置页「重新检测」点了会一直停在「检测中…」——检测其实 1 秒就回来了，
+//       但三处检测入口各自 QueuedUserWorkItem、没有任何一处负责刷新设置页标签。现在统一走
+//       BeginDshCheck()：防重入（连点不会起一堆 PowerShell）、检测中禁用按钮、结果回来时
+//       通过 RefreshDshStatusLabels() 刷新标签；连点与「检测中」态都有了明确表现。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -92,8 +96,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.7.0.0")]
-[assembly: AssemblyFileVersion("3.7.0.0")]
+[assembly: AssemblyVersion("3.7.1.0")]
+[assembly: AssemblyFileVersion("3.7.1.0")]
 
 namespace DshPanel
 {
@@ -1703,6 +1707,7 @@ namespace DshPanel
         Label setupStatus;
         bool dshInstalled;           // 检测结果：dsh 包可用
         bool dshChecked;             // 检测已完成
+        bool dshChecking;            // 检测进行中（防重入 + 设置页显示「检测中…」）
         Program.DshCheckState dshState; // 最近一次检测的三态结果
 
         // 设置页读取的检测状态
@@ -1770,10 +1775,7 @@ namespace DshPanel
                     }
                 }
                 // v3.1：检测 DeepSeek Harness 是否可用——缺失则进入安装指引页
-                Program.CheckDshAsync(delegate(Program.DshCheckState st)
-                {
-                    TryBeginInvoke(delegate { OnDshCheckResult(st); });
-                });
+                BeginDshCheck();
                 // v3.3：更新提示——延迟 12 秒再查，绝不和启动抢时间（只提示，不自动升级）
                 if (Program.updateCheckEnabled)
                 {
@@ -2224,7 +2226,10 @@ namespace DshPanel
             dshChecked = true;
             dshState = state;
             dshInstalled = state == Program.DshCheckState.Installed;
+            dshChecking = false;
             Program.BootMark("dsh-check: " + state);
+            // v3.7.1：检测结果必须落到设置页上——原来这里不刷新，设置页就一直显示「检测中…」
+            RefreshDshStatusLabels();
             if (state == Program.DshCheckState.Installed)
             {
                 Program.LogEvent(LogKind.Success, "DeepSeek Harness 已就绪");
@@ -2318,13 +2323,11 @@ namespace DshPanel
             btnSetupRecheck.Margin = new Padding(140, 6, 140, 6);
             btnSetupRecheck.Click += delegate
             {
+                if (dshChecking) return;
                 setupStatus.Text = "正在重新检测…";
                 setupStatus.ForeColor = Theme.TextFaint;
                 Program.LogEvent(LogKind.Info, "正在重新检测 DeepSeek Harness…");
-                Program.CheckDshAsync(delegate(Program.DshCheckState st)
-                {
-                    TryBeginInvoke(delegate { OnDshCheckResult(st); });
-                });
+                BeginDshCheck();
             };
 
             setupStatus = new Label();
@@ -2354,14 +2357,40 @@ namespace DshPanel
             setupPanel.BringToFront();
         }
 
+        // 统一的「检测 DeepSeek Harness」入口（v3.7.1 修）：三处调用（启动检测 / 安装指引页 /
+        // 设置页「重新检测」）都走这里，因为原来的问题正是「三处各写一遍、没人负责刷新界面」——
+        // 设置页点「重新检测」后标签永远停在「检测中…」（检测其实 1 秒就回来了，只是没人更新标签）。
+        internal bool DshChecking { get { return dshChecking; } }
+
+        void BeginDshCheck()
+        {
+            if (dshChecking) return;                 // 防重入：连点不会起一堆 PowerShell
+            dshChecking = true;
+            RefreshDshStatusLabels();
+            Program.CheckDshAsync(delegate(Program.DshCheckState st)
+            {
+                dshChecking = false;
+                // 回调在后台线程：回 UI 线程再改界面
+                TryBeginInvoke(delegate { OnDshCheckResult(st); });
+            });
+        }
+
+        // 检测状态变化时，把所有显示 DSH 状态的地方一起刷新
+        void RefreshDshStatusLabels()
+        {
+            try { if (settingsWindow != null) settingsWindow.RefreshDshStatus(); } catch { }
+        }
+
         // 设置页回调：重新检测 dsh 可用性
         public void RecheckDsh()
         {
-            Program.LogEvent(LogKind.Info, "正在重新检测 DeepSeek Harness…");
-            Program.CheckDshAsync(delegate(Program.DshCheckState st)
+            if (dshChecking)
             {
-                TryBeginInvoke(delegate { OnDshCheckResult(st); });
-            });
+                Program.LogEvent(LogKind.Info, "检测已在进行中，忽略这次重复请求");
+                return;
+            }
+            Program.LogEvent(LogKind.Info, "正在重新检测 DeepSeek Harness…");
+            BeginDshCheck();
         }
 
         // 设置页回调：开机自启写入（与托盘菜单联动）
@@ -3046,7 +3075,9 @@ namespace DshPanel
             if (lblDshStatus == null) return;
             try
             {
-                if (!owner.DshChecked)
+                bool busy = owner != null && owner.DshChecking;
+                if (btnRecheck != null) { btnRecheck.Enabled = !busy; btnRecheck.Text = busy ? "检测中…" : "重新检测"; }
+                if (busy || owner == null || !owner.DshChecked)
                 {
                     lblDshStatus.Text = "DeepSeek Harness：检测中…";
                     lblDshStatus.ForeColor = Theme.TextMuted;
@@ -3279,9 +3310,13 @@ namespace DshPanel
             btnRecheck.Margin = new Padding(10, 4, 0, 4);
             btnRecheck.Click += delegate
             {
+                if (owner == null) return;
+                if (owner.DshChecking) return;              // 正在检测，忽略重复点击
                 lblDshStatus.Text = "DeepSeek Harness：检测中…";
                 lblDshStatus.ForeColor = Theme.TextMuted;
-                if (owner != null) owner.RecheckDsh();
+                btnRecheck.Enabled = false;
+                btnRecheck.Text = "检测中…";
+                owner.RecheckDsh();
             };
 
             row.Controls.Add(lblDshStatus, 0, 0);
