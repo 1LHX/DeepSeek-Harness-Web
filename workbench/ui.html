@@ -10,19 +10,27 @@
 <style>
 :host, .wb-app { all: initial; }
 .wb-app {
+  /* 与 dsh-panel.cs 的 Theme 对齐：同一套蓝白 + 同一套圆角节奏 */
   --wb-bg: #ffffff;
-  --wb-bg-soft: #f7f9fc;
-  --wb-bg-sunk: #eef2f8;
-  --wb-line: #e2e8f2;
-  --wb-line-strong: #cfd8e6;
-  --wb-text: #1f2a37;
-  --wb-text-soft: #5b6b82;
-  --wb-text-faint: #8b9ab1;
-  --wb-blue: #2563eb;
+  --wb-bg-soft: #f6f9fe;
+  --wb-bg-sunk: #eaf0f9;
+  --wb-line: #e2ebf7;
+  --wb-line-strong: #cedcf0;
+  --wb-text: #152238;
+  --wb-text-soft: #364863;
+  --wb-text-faint: #93a3bb;
+  --wb-blue: #2f6bff;
+  --wb-blue-hover: #1e57e7;
+  --wb-blue-press: #1545c6;
+  --wb-blue-light: #5c8fff;
   --wb-blue-soft: #eaf1ff;
-  --wb-green: #14a05a;
-  --wb-amber: #d97706;
-  --wb-red: #dc2626;
+  --wb-blue-ink: #173d8d;
+  --wb-green: #109e60;
+  --wb-amber: #e68a0c;
+  --wb-red: #db4444;
+  --wb-r-card: 14px;
+  --wb-r-btn: 10px;
+  --wb-r-chip: 9px;
   --wb-mono: Consolas, "Cascadia Mono", "JetBrains Mono", "Sarasa Mono SC", monospace;
   --wb-sans: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
   position: fixed; inset: 0; pointer-events: none; z-index: 2147483001;
@@ -36,14 +44,24 @@
 /* ---------- 悬浮入口 ---------- */
 .wb-launcher {
   position: fixed; right: 20px; bottom: 92px; pointer-events: auto;
-  display: flex; align-items: center; gap: 7px;
-  padding: 9px 15px 9px 12px; border: none; border-radius: 999px;
-  background: linear-gradient(135deg, #2b6cff, #1e4fd8); color: #fff;
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 16px 8px 10px; border: none; border-radius: 999px;
+  background: linear-gradient(148deg, var(--wb-blue-light), var(--wb-blue-press)); color: #fff;
   font-weight: 600; font-size: 13px; letter-spacing: .2px;
-  box-shadow: 0 8px 22px rgba(37, 99, 235, .34), 0 1px 2px rgba(15, 23, 42, .2);
+  box-shadow: 0 10px 24px rgba(47, 107, 255, .34), 0 1px 2px rgba(15, 23, 42, .16);
   transition: transform .16s ease, box-shadow .16s ease, opacity .16s ease;
 }
-.wb-launcher:hover { transform: translateY(-1px); box-shadow: 0 12px 26px rgba(37, 99, 235, .42); }
+.wb-launcher:hover { transform: translateY(-1px); box-shadow: 0 14px 30px rgba(47, 107, 255, .42); }
+
+/* 品牌标：和面板顶栏 / 应用图标同一枚「›_」 */
+.wb-mark {
+  width: 22px; height: 22px; flex: none; border-radius: 7px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: linear-gradient(148deg, var(--wb-blue-light), var(--wb-blue-press));
+  box-shadow: 0 2px 6px rgba(47, 107, 255, .32);
+}
+.wb-mark svg { width: 14px; height: 14px; display: block; }
+.wb-mark.wb-mark-flat { background: rgba(255, 255, 255, .18); box-shadow: none; }
 .wb-launcher:active { transform: translateY(0) scale(.985); }
 .wb-launcher .wb-kbd {
   font: 600 10px/1 var(--wb-mono); background: rgba(255,255,255,.22);
@@ -84,15 +102,7 @@
 /* 头部 */
 .wb-head { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px 0; background: var(--wb-bg); }
 .wb-head-top { display: flex; align-items: center; gap: 10px; }
-.wb-logo {
-  width: 22px; height: 22px; border-radius: 7px; flex: none;
-  background: linear-gradient(135deg, #2b6cff, #1e4fd8);
-  box-shadow: 0 2px 6px rgba(37,99,235,.35); position: relative;
-}
-.wb-logo::after {
-  content: ""; position: absolute; inset: 6px; border-radius: 3px;
-  border: 1.6px solid #fff; border-top-color: transparent; border-right-color: transparent;
-}
+/* 品牌标样式见 .wb-mark（与图标/顶栏同一枚） */
 .wb-title { font-weight: 700; font-size: 14px; letter-spacing: .2px; }
 .wb-ver { font: 600 10px/1 var(--wb-mono); color: var(--wb-text-faint); background: var(--wb-bg-sunk); padding: 3px 5px; border-radius: 5px; }
 .wb-spacer { flex: 1; }
@@ -137,13 +147,13 @@
 }
 .wb-toolbar .wb-grow { flex: 1; min-width: 0; }
 .wb-search {
-  margin: 8px 10px; padding: 6px 9px; border: 1px solid var(--wb-line-strong); border-radius: 7px;
+  margin: 8px 10px; padding: 6px 10px; border: 1px solid var(--wb-line-strong); border-radius: var(--wb-r-btn);
   background: #fff; color: var(--wb-text); outline: none; font-size: 12px;
 }
 .wb-search:focus { border-color: var(--wb-blue); box-shadow: 0 0 0 3px var(--wb-blue-soft); }
 .wb-btn {
   border: 1px solid var(--wb-line-strong); background: #fff; color: var(--wb-text);
-  padding: 4px 9px; border-radius: 6px; font-weight: 600; white-space: nowrap;
+  padding: 4px 10px; border-radius: var(--wb-r-btn); font-weight: 600; white-space: nowrap;
 }
 .wb-btn:hover { border-color: var(--wb-blue); color: var(--wb-blue); }
 .wb-btn.wb-primary { background: var(--wb-blue); border-color: var(--wb-blue); color: #fff; }
@@ -159,7 +169,7 @@
 /* 文件树 */
 .wb-tree { flex: 1; overflow: auto; padding: 2px 6px 12px; font-size: 12px; }
 .wb-row {
-  display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 6px;
+  display: flex; align-items: center; gap: 6px; padding: 3px 7px; border-radius: var(--wb-r-chip);
   cursor: pointer; white-space: nowrap; overflow: hidden; color: var(--wb-text);
 }
 .wb-row:hover { background: #e9eff9; }
@@ -192,10 +202,10 @@
 .wb-img { max-width: 100%; max-height: 100%; display: block; margin: 18px auto; box-shadow: 0 4px 18px rgba(15,23,42,.12); border-radius: 6px; }
 
 /* 终端 */
-.wb-term { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #0f172a; }
+.wb-term { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #0d1830; }
 .wb-term-bar {
   display: flex; align-items: center; gap: 8px; padding: 7px 10px; flex: none;
-  background: #131c31; border-bottom: 1px solid #1f2a44; color: #9fb0cc;
+  background: #12203c; border-bottom: 1px solid #1e2f52; color: #a9bcd8;
 }
 .wb-term-bar select {
   background: #1b2540; color: #cfe0ff; border: 1px solid #2b3a5f; border-radius: 6px; padding: 3px 6px; outline: none;
@@ -216,15 +226,15 @@
 .wb-term-out .wb-err { color: #fca5a5; }
 .wb-term-out .wb-ok { color: #6ee7a8; }
 .wb-term-out .wb-cmd-echo { color: #8ab4f8; font-weight: 600; }
-.wb-term-input { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #131c31; border-top: 1px solid #1f2a44; flex: none; }
+.wb-term-input { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #12203c; border-top: 1px solid #1e2f52; flex: none; }
 .wb-prompt { color: #6ee7a8; font: 600 13px var(--wb-mono); }
 .wb-cmd {
-  flex: 1; background: #0b1222; border: 1px solid #2b3a5f; border-radius: 6px; color: #e6eefc;
+  flex: 1; background: #0b1526; border: 1px solid #22345c; border-radius: var(--wb-r-btn); color: #e6eefc;
   padding: 7px 9px; font: 12px var(--wb-mono); outline: none;
 }
 .wb-cmd:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.18); }
 .wb-confirm {
-  margin: 0 10px 8px; padding: 10px 12px; border-radius: 8px; flex: none;
+  margin: 0 10px 8px; padding: 10px 12px; border-radius: var(--wb-r-btn); flex: none;
   border: 1px solid #7f1d1d; background: #2b0f0f; color: #fecaca; display: none; gap: 10px; align-items: center;
 }
 .wb-confirm.wb-on { display: flex; }
@@ -234,15 +244,15 @@
 /* 任务看板 */
 .wb-tasks { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .wb-goal {
-  margin: 10px 12px 0; padding: 10px 12px; border-radius: 9px; flex: none;
-  background: linear-gradient(135deg, #f2f7ff, #eaf1ff); border: 1px solid #d8e5ff;
+  margin: 10px 12px 0; padding: 11px 13px; border-radius: var(--wb-r-card); flex: none;
+  background: linear-gradient(140deg, #f4f8ff, var(--wb-blue-soft)); border: 1px solid #dbe7ff;
   display: flex; gap: 10px; align-items: flex-start;
 }
 .wb-goal .wb-goal-ico { font-size: 15px; }
 .wb-goal-text { flex: 1; min-width: 0; font-size: 12.5px; line-height: 1.6; color: #1e3a8a; }
 .wb-goal .wb-muted { font-size: 11px; }
 .wb-columns { display: flex; gap: 10px; padding: 10px 12px; flex: none; }
-.wb-col { flex: 1; min-width: 0; background: var(--wb-bg-soft); border: 1px solid var(--wb-line); border-radius: 9px; display: flex; flex-direction: column; max-height: 46vh; }
+.wb-col { flex: 1; min-width: 0; background: var(--wb-bg-soft); border: 1px solid var(--wb-line); border-radius: var(--wb-r-card); display: flex; flex-direction: column; max-height: 44vh; }
 .wb-col h4 {
   margin: 0; padding: 8px 10px; font-size: 11.5px; letter-spacing: .3px; color: var(--wb-text-soft);
   border-bottom: 1px solid var(--wb-line); display: flex; align-items: center; gap: 6px; font-weight: 700;
@@ -252,7 +262,7 @@
 .wb-cards { padding: 8px; display: flex; flex-direction: column; gap: 6px; overflow: auto; }
 .wb-card {
   background: #fff; border: 1px solid var(--wb-line); border-left: 3px solid var(--wb-line-strong);
-  border-radius: 7px; padding: 7px 9px; font-size: 12px; line-height: 1.5; color: var(--wb-text);
+  border-radius: var(--wb-r-btn); padding: 8px 10px; font-size: 12px; line-height: 1.5; color: var(--wb-text);
   box-shadow: 0 1px 2px rgba(15,23,42,.04);
 }
 .wb-col[data-status="pending"] .wb-card { border-left-color: #c3cedf; }
@@ -294,7 +304,7 @@
 /* 变更 / diff */
 .wb-list { flex: 1; min-height: 0; overflow: auto; padding: 6px; }
 .wb-item {
-  display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px;
+  display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: var(--wb-r-chip);
   cursor: pointer; font-size: 12px;
 }
 .wb-item:hover { background: #e9eff9; }
@@ -367,9 +377,9 @@
     <div class="wb-resizer" id="wb-resizer" title="拖动调整宽度 · 双击复位"></div>
     <div class="wb-head">
       <div class="wb-head-top">
-        <div class="wb-logo"></div>
+        <span class="wb-mark"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 6.5 11.6 12 7 17.5"/><path d="M13.4 17.5h4.2"/></svg></span>
         <div class="wb-title">DSH 工作台</div>
-        <span class="wb-ver" id="wb-ver">v3.5.0</span>
+        <span class="wb-ver" id="wb-ver">v3.7.0</span>
         <div class="wb-spacer"></div>
         <div class="wb-ws" id="wb-ws" title="点击切换工作区目录">
           <span>📁</span><span class="wb-ws-path" id="wb-ws-path">…</span>
@@ -518,7 +528,8 @@
   </aside>
 
   <button class="wb-launcher" id="wb-launcher" title="打开工作台（F2）">
-    <span>🧰</span><span>工作台</span><span class="wb-kbd">F2</span>
+    <span class="wb-mark wb-mark-flat"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 6.5 11.6 12 7 17.5"/><path d="M13.4 17.5h4.2"/></svg></span>
+    <span>工作台</span><span class="wb-kbd">F2</span>
   </button>
 
   <div class="wb-editor" id="wb-editor">

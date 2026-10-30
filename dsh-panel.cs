@@ -65,6 +65,10 @@
 //       目标取你在 DSH 里发的那句话，卡片上带工具数与最近工具），Agent 自己维护的
 //       todo 清单与排队消息叠在上面，所以不再出现「待规划/进行中永远为空」；
 //       抽屉宽度可拖拽（双击复位、记住上次值），遮罩不再拦点击，开着抽屉也能用页面。
+// v3.7（设计统一）：整套界面收敛到**蓝 + 白**单一色系 + 大圆角，见 dsh-panel.cs 的 Theme 段：
+//       顶栏白底 + 蓝色品牌标 + URL 浅蓝 chip；状态胶囊改成「浅底 + 同色深字 + 实心点」
+//       （不再大块饱和填充）；按钮/开关/卡片/输入框统一圆角与边框；日志与设置页沿用同一套 token；
+//       占位页与工作台同步换色；应用图标 / 托盘图标 / Logo 共用同一枚「›_」标记（圆头线段，无尖角）。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -88,8 +92,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.6.0.0")]
-[assembly: AssemblyFileVersion("3.6.0.0")]
+[assembly: AssemblyVersion("3.7.0.0")]
+[assembly: AssemblyFileVersion("3.7.0.0")]
 
 namespace DshPanel
 {
@@ -99,36 +103,77 @@ namespace DshPanel
 
     // ---------- 主题（集中配色，便于统一调整） ----------
 
+    // 设计系统（v3.7）：**蓝 + 白** 单一色系，圆角为主、无硬边。
+    //
+    // 约定（改界面请只从这里取色/取半径，别再在控件里写死颜色）：
+    //   * 底色/卡片：白 + 两级浅蓝灰；分隔线一律 1px 冷灰蓝
+    //   * 主色只有一个蓝，浅蓝(BlueSoft)只做「底」，深蓝(BlueInk)做「底上的字」
+    //   * 状态色（绿/琥珀/红）只用于状态，且配 soft 底 + ink 字，不铺大面积
+    //   * 圆角：卡片 16 / 按钮 12 / 小控件 9 / 胶囊 = 高的一半
     static class Theme
     {
-        public static readonly Color Bg = Color.FromArgb(245, 247, 250);
+        // ---- 品牌蓝 ----
+        public static readonly Color Blue = Color.FromArgb(47, 107, 255);        // #2F6BFF
+        public static readonly Color BlueHover = Color.FromArgb(30, 87, 231);
+        public static readonly Color BluePress = Color.FromArgb(21, 69, 198);
+        public static readonly Color BlueLight = Color.FromArgb(92, 143, 255);   // 渐变高光端
+        public static readonly Color BlueSoft = Color.FromArgb(234, 241, 255);   // #EAF1FF 浅蓝底
+        public static readonly Color BlueSoftHover = Color.FromArgb(220, 232, 255);
+        public static readonly Color BlueInk = Color.FromArgb(23, 61, 141);      // 浅蓝底上的深蓝字
+
+        // 旧名字保留（品牌并入蓝系，避免历史调用点出现第二种主色）
+        public static readonly Color Indigo = Blue;
+        public static readonly Color Violet = BlueLight;
+
+        // ---- 中性（白 + 冷蓝灰）----
+        public static readonly Color Bg = Color.FromArgb(247, 250, 255);         // 窗口底 #F7FAFF
+        public static readonly Color Surface = Color.FromArgb(242, 247, 255);    // 浅蓝面板
         public static readonly Color Card = Color.White;
-        public static readonly Color Border = Color.FromArgb(229, 231, 235);
-        public static readonly Color TextStrong = Color.FromArgb(31, 41, 55);
-        public static readonly Color TextMuted = Color.FromArgb(107, 114, 128);
-        public static readonly Color TextFaint = Color.FromArgb(156, 163, 175);
+        public static readonly Color Border = Color.FromArgb(226, 236, 248);
+        public static readonly Color BorderStrong = Color.FromArgb(205, 220, 241);
+        public static readonly Color Divider = Color.FromArgb(237, 244, 253);
 
-        public static readonly Color Indigo = Color.FromArgb(79, 70, 229);
-        public static readonly Color Violet = Color.FromArgb(124, 58, 237);
+        // ---- 文字 ----
+        public static readonly Color TextStrong = Color.FromArgb(21, 34, 56);
+        public static readonly Color Text = Color.FromArgb(54, 72, 99);
+        public static readonly Color TextMuted = Color.FromArgb(105, 123, 150);
+        public static readonly Color TextFaint = Color.FromArgb(147, 163, 187);
 
-        public static readonly Color Green = Color.FromArgb(16, 185, 129);
-        public static readonly Color GreenHover = Color.FromArgb(5, 150, 105);
-        public static readonly Color GreenPress = Color.FromArgb(4, 120, 87);
+        // ---- 状态 ----
+        public static readonly Color Green = Color.FromArgb(16, 158, 96);
+        public static readonly Color GreenHover = Color.FromArgb(12, 136, 82);
+        public static readonly Color GreenPress = Color.FromArgb(9, 112, 68);
+        public static readonly Color GreenSoft = Color.FromArgb(232, 248, 240);
+        public static readonly Color GreenInk = Color.FromArgb(10, 108, 66);
 
-        public static readonly Color Red = Color.FromArgb(239, 68, 68);
-        public static readonly Color RedHover = Color.FromArgb(220, 48, 48);
-        public static readonly Color RedPress = Color.FromArgb(185, 28, 28);
+        public static readonly Color Amber = Color.FromArgb(230, 138, 12);
+        public static readonly Color AmberSoft = Color.FromArgb(255, 246, 230);
+        public static readonly Color AmberInk = Color.FromArgb(150, 88, 8);
 
-        public static readonly Color Blue = Color.FromArgb(59, 130, 246);
-        public static readonly Color BlueHover = Color.FromArgb(37, 99, 235);
-        public static readonly Color BluePress = Color.FromArgb(29, 78, 216);
+        public static readonly Color Red = Color.FromArgb(219, 68, 68);
+        public static readonly Color RedHover = Color.FromArgb(200, 52, 52);
+        public static readonly Color RedPress = Color.FromArgb(170, 38, 38);
+        public static readonly Color RedSoft = Color.FromArgb(254, 238, 238);
+        public static readonly Color RedInk = Color.FromArgb(163, 40, 40);
 
-        public static readonly Color Amber = Color.FromArgb(245, 158, 11);
+        // 开关轨道（关态）：冷蓝灰，和 Border 系同族但不与卡片边混淆
+        public static readonly Color SwitchOff = Color.FromArgb(214, 225, 241);
+        public static readonly Color SwitchOffHover = Color.FromArgb(203, 216, 235);
 
-        // 圆角体系（大圆角少棱角，各控件统一）
-        public const int RadiusCard = 14;      // 大卡片（设置分区 / 日志卡片）
-        public const int RadiusButton = 11;    // 主按钮
-        public const int RadiusSmall = 8;      // 工具栏小按钮
+        public static readonly Color Gray = Color.FromArgb(148, 163, 184);
+        public static readonly Color GraySoft = Color.FromArgb(243, 246, 251);
+        public static readonly Color GrayInk = Color.FromArgb(94, 111, 137);
+
+        // ---- 圆角（所有可见形状都从这里取）----
+        public const int RadiusCard = 16;      // 大卡片（设置分区 / 日志卡片）
+        public const int RadiusButton = 12;    // 主按钮
+        public const int RadiusSmall = 9;      // 工具栏小按钮 / chip
+        public const int RadiusMini = 7;       // 小圆点容器等
+
+        // ---- 间距（统一节奏）----
+        public const int Gap = 8;
+        public const int PadCard = 16;
+        public const int TopBarHeight = 46;
     }
 
     // ---------- 绘制工具 ----------
@@ -183,42 +228,108 @@ namespace DshPanel
             }
         }
 
-        // 应用 Logo：渐变圆角方块 + 白色粗体 D
+        // ---------- 形状工具（v3.7：界面里所有可见形状都走这里，保证「没有硬边」） ----------
+
+        public static int Pill(int h) { return Math.Max(2, h / 2); }
+
+        public static void FillRound(Graphics g, Rectangle r, int radius, Color color)
+        {
+            int rad = radius < 0 ? Pill(r.Height) : radius;
+            rad = Math.Min(rad, Math.Min(r.Width, r.Height) / 2);
+            if (rad <= 1) { using (SolidBrush b = new SolidBrush(color)) g.FillRectangle(b, r); return; }
+            using (GraphicsPath path = RoundedRect(r, rad))
+            using (SolidBrush b = new SolidBrush(color)) g.FillPath(b, path);
+        }
+
+        public static void StrokeRound(Graphics g, Rectangle r, int radius, Color color, float width)
+        {
+            int rad = radius < 0 ? Pill(r.Height) : radius;
+            rad = Math.Max(1, Math.Min(rad, Math.Min(r.Width, r.Height) / 2));
+            using (GraphicsPath path = RoundedRect(r, rad))
+            using (Pen p = new Pen(color, width)) { p.Alignment = PenAlignment.Inset; g.DrawPath(p, path); }
+        }
+
+        // 白色卡片：极轻投影 + 1px 冷蓝灰边（比纯描边更"浮"一点，但不脏）
+        public static void DrawSoftCard(Graphics g, Rectangle r, int radius)
+        {
+            int rad = Math.Max(2, Math.Min(radius, Math.Min(r.Width, r.Height) / 2));
+            using (GraphicsPath sh = RoundedRect(new Rectangle(r.X, r.Y + 2, r.Width, r.Height), rad))
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(8, 20, 50, 110))) g.FillPath(b, sh);
+            using (GraphicsPath path = RoundedRect(r, rad))
+            using (SolidBrush fill = new SolidBrush(Theme.Card)) g.FillPath(fill, path);
+            StrokeRound(g, r, rad, Theme.Border, 1F);
+        }
+
+        // 状态色 → 浅底 / 深字（状态胶囊、chip 统一走这两个）
+        public static Color Soft(Color c) { return Blend(c, Color.White, 0.90F); }
+        public static Color Ink(Color c) { return Darken(c, 0.74F); }
+
+        // 应用到 Cursor：圆角不铺满时，先用父容器底色垫一层
+        public static void Chip(Graphics g, Rectangle r, Color fill, Color border)
+        {
+            FillRound(g, r, Theme.RadiusSmall, fill);
+            if (border.A > 0) StrokeRound(g, r, Theme.RadiusSmall, border, 1F);
+        }
+
+        // 应用 Logo：蓝色圆角方块 + 白色「›_」提示符（终端与对话的合体）。
+        // 全部用圆头线段绘制，缩到 16px 依然干净，没有一处尖角。
         public static void DrawLogo(Graphics g, int x, int y, int size)
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             Rectangle r = new Rectangle(x, y, size, size);
-            using (GraphicsPath path = RoundedRect(r, Math.Max(8, size / 3)))
+            int rad = Math.Max(6, (int)Math.Round(size * 0.30));
+            using (GraphicsPath path = RoundedRect(r, rad))
             using (LinearGradientBrush brush = new LinearGradientBrush(
-                new RectangleF(x, y, size, size), Theme.Indigo, Theme.Violet, 45F))
+                new RectangleF(x, y, size, size), Theme.BlueLight, Theme.BluePress, 62F))
             {
                 g.FillPath(brush, path);
             }
-            using (Font f = new Font("Segoe UI", size * 0.5F, FontStyle.Bold, GraphicsUnit.Pixel))
+            // 上半部一层微高光，避免整块死平
+            using (GraphicsPath hiPath = RoundedRect(new Rectangle(x, y, size, (int)(size * 0.52)), rad))
+            using (SolidBrush hi = new SolidBrush(Color.FromArgb(34, 255, 255, 255)))
             {
-                TextRenderer.DrawText(g, "D", f, r, Color.White,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                g.FillPath(hi, hiPath);
+            }
+            float u = size / 26F;
+            float cx = x + size * 0.5F, cy = y + size * 0.5F;
+            using (Pen pen = new Pen(Color.White, Math.Max(1.6F, 2.5F * u)))
+            {
+                pen.StartCap = LineCap.Round;
+                pen.EndCap = LineCap.Round;
+                pen.LineJoin = LineJoin.Round;
+                g.DrawLines(pen, new PointF[] {
+                    new PointF(cx - 6.4F * u, cy - 4.8F * u),
+                    new PointF(cx - 1.6F * u, cy),
+                    new PointF(cx - 6.4F * u, cy + 4.8F * u)
+                });
+                g.DrawLine(pen, cx + 0.4F * u, cy + 4.8F * u, cx + 6.2F * u, cy + 4.8F * u);
             }
         }
 
-        // 按钮几何图标（不依赖字体，绘制清晰）
+        // 按钮图标：统一圆头线宽（Play 用圆角描边把三角形"磨圆"，不再有尖角）
         public static void DrawButtonIcon(Graphics g, ButtonIcon icon, int cx, int cy, Color color)
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             if (icon == ButtonIcon.Play)
             {
-                PointF[] tri = { new PointF(cx - 4.5F, cy - 6F), new PointF(cx - 4.5F, cy + 6F), new PointF(cx + 6.5F, cy) };
+                PointF[] tri = { new PointF(cx - 3.8F, cy - 5.4F), new PointF(cx - 3.8F, cy + 5.4F), new PointF(cx + 5.2F, cy) };
+                using (GraphicsPath p = new GraphicsPath())
+                {
+                    p.AddPolygon(tri);
+                    using (Pen pen = new Pen(color, 2.8F)) { pen.LineJoin = LineJoin.Round; g.DrawPath(pen, p); }
+                }
                 using (SolidBrush b = new SolidBrush(color)) g.FillPolygon(b, tri);
             }
             else if (icon == ButtonIcon.Stop)
             {
-                using (SolidBrush b = new SolidBrush(color))
-                    g.FillRectangle(b, cx - 4.5F, cy - 4.5F, 9F, 9F);
+                FillRound(g, new Rectangle(cx - 5, cy - 5, 10, 10), 3, color);
             }
             else if (icon == ButtonIcon.Globe)
             {
-                using (Pen p = new Pen(color, 1.5F))
+                using (Pen p = new Pen(color, 1.6F))
                 {
+                    p.StartCap = LineCap.Round;
+                    p.EndCap = LineCap.Round;
                     g.DrawEllipse(p, cx - 6F, cy - 6F, 12F, 12F);
                     g.DrawEllipse(p, cx - 2.6F, cy - 6F, 5.2F, 12F);   // 经线
                     g.DrawLine(p, cx, cy - 6F, cx, cy + 6F);          // 竖轴
@@ -1931,19 +2042,21 @@ namespace DshPanel
                     using (Graphics g = Graphics.FromImage(bmp))
                     {
                         g.SmoothingMode = SmoothingMode.AntiAlias;
-                        using (GraphicsPath path = Ui.RoundedRect(new Rectangle(1, 1, 14, 14), 4))
+                        // 品牌蓝圆角方块（半径 5/14 ≈ 0.36，托盘 16px 下也是圆润的胶囊感）
+                        using (GraphicsPath path = Ui.RoundedRect(new Rectangle(1, 1, 14, 14), 5))
                         using (LinearGradientBrush b = new LinearGradientBrush(
-                            new RectangleF(1, 1, 14, 14), Theme.Indigo, Theme.Violet, 45F))
+                            new RectangleF(1, 1, 14, 14), Theme.BlueLight, Theme.BluePress, 62F))
                         {
                             g.FillPath(b, path);
                         }
+                        // 状态点：深色底座 + 白圈，任何桌面底色上都看得清
+                        using (SolidBrush halo = new SolidBrush(Color.White))
+                        {
+                            g.FillEllipse(halo, 7.2F, 7.2F, 8.2F, 8.2F);
+                        }
                         using (SolidBrush s = new SolidBrush(dot))
                         {
-                            g.FillEllipse(s, 8.5F, 8.5F, 6.5F, 6.5F);
-                        }
-                        using (Pen p = new Pen(Color.White, 1F))
-                        {
-                            g.DrawEllipse(p, 8.5F, 8.5F, 6.5F, 6.5F);
+                            g.FillEllipse(s, 8.4F, 8.4F, 5.8F, 5.8F);
                         }
                     }
                     // Clone：让图标拥有自己的句柄，交给 NotifyIcon 管理
@@ -1988,7 +2101,7 @@ namespace DshPanel
             layout.Padding = new Padding(0);
             layout.BackColor = Theme.Bg;
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));    // 0: 顶栏
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, Theme.TopBarHeight));    // 0: 顶栏
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 1: 网页（铺满）
             rootLayout = layout;
 
@@ -2012,7 +2125,7 @@ namespace DshPanel
             // 状态胶囊：绿=运行 / 红=未运行 / 琥珀=切换中，点击启停
             statusCapsule = new StatusCapsule();
             statusCapsule.Dock = DockStyle.Fill;
-            statusCapsule.Margin = new Padding(4, 6, 2, 6);
+            statusCapsule.Margin = new Padding(6, 9, 4, 9);
             statusCapsule.SetStatus("检测中…", Theme.TextMuted);
             capsuleTip = new ToolTip();
             capsuleTip.SetToolTip(statusCapsule, "端口 " + Program.Port);
@@ -2034,7 +2147,7 @@ namespace DshPanel
             // v3.5：工作台入口（文件 / 终端 / 任务 / 变更 / Git）
             btnWorkbench = new SmallButton("工作台");
             btnWorkbench.Dock = DockStyle.Fill;
-            btnWorkbench.Margin = new Padding(2, 6, 2, 6);
+            btnWorkbench.Margin = new Padding(2, 9, 2, 9);
             btnWorkbench.Click += delegate
             {
                 try { Wb.ToggleUi(); }
@@ -2044,7 +2157,7 @@ namespace DshPanel
             // 设置按钮：打开设置页（含关于、偏好开关、DSH 状态与重新检测）
             btnSettings = new SmallButton("设置");
             btnSettings.Dock = DockStyle.Fill;
-            btnSettings.Margin = new Padding(2, 6, 12, 6);
+            btnSettings.Margin = new Padding(2, 9, 14, 9);
             btnSettings.Click += delegate { ShowSettingsWindow(); };
 
             topRow.Controls.Add(header, 0, 0);
@@ -2184,7 +2297,7 @@ namespace DshPanel
             setupTitle.Text = "DeepSeek Harness 未安装";
             setupTitle.Dock = DockStyle.Fill;
             setupTitle.TextAlign = ContentAlignment.MiddleCenter;
-            setupTitle.Font = new Font("Segoe UI", 20F, FontStyle.Bold, GraphicsUnit.Point);
+            setupTitle.Font = new Font("Microsoft YaHei UI", 17F, FontStyle.Bold, GraphicsUnit.Point);
             setupTitle.ForeColor = Theme.TextStrong;
             setupTitle.BackColor = Theme.Bg;
 
@@ -2316,16 +2429,30 @@ namespace DshPanel
             string color = starting ? "#f59e0b" : "#9ca3af";
             string title = starting ? "服务启动中…" : "服务未运行";
             string sub = starting ? "端口就绪后自动加载 DSH 面板" : "点击「启动服务」后此处将显示 DSH 面板";
+            // v3.7：占位页也走同一套蓝白设计（圆角卡片 + 轻投影 + 品牌标），不再是大白板
             string html =
                 "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>" +
-                "body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;" +
-                "background:#f5f7fa;font-family:'Microsoft YaHei UI',sans-serif;color:#6b7280;}" +
-                ".box{text-align:center}.dot{width:16px;height:16px;border-radius:50%;margin:0 auto 18px;" +
-                "background:" + color + ";box-shadow:0 0 12px " + color + "55;}" +
-                "h2{margin:0 0 10px;font-size:20px;color:#374151;font-weight:600}" +
-                "p{margin:0;font-size:13px}</style></head><body>" +
-                "<div class=\"box\"><div class=\"dot\"></div><h2>" + title + "</h2><p>" + sub + "</p></div>" +
-                "</body></html>";
+                ":root{--blue:#2F6BFF;--ink:#152238;--muted:#697B96;--line:#E2EBF7;--soft:#F7FAFF;}" +
+                "*{box-sizing:border-box}" +
+                "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;" +
+                "background:var(--soft);font-family:'Microsoft YaHei UI',-apple-system,'Segoe UI',sans-serif;color:var(--muted);}" +
+                ".card{width:min(420px,86vw);background:#fff;border:1px solid var(--line);border-radius:18px;" +
+                "padding:34px 30px 30px;text-align:center;box-shadow:0 18px 44px rgba(20,50,110,.10),0 2px 6px rgba(20,50,110,.05);}" +
+                ".mark{width:54px;height:54px;margin:0 auto 18px;border-radius:16px;" +
+                "background:linear-gradient(150deg,#5C8FFF,#1545C6);display:flex;align-items:center;justify-content:center;" +
+                "box-shadow:0 8px 20px rgba(47,107,255,.32);}" +
+                ".mark svg{width:28px;height:28px}" +
+                "h2{margin:0 0 8px;font-size:17px;color:var(--ink);font-weight:700;letter-spacing:.2px}" +
+                "p{margin:0;font-size:12.5px;line-height:1.7}" +
+                ".dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:7px;" +
+                "background:" + color + ";box-shadow:0 0 0 3px " + color + "22;vertical-align:1px}" +
+                "</style></head><body>" +
+                "<div class=\"card\">" +
+                "<div class=\"mark\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#fff\" stroke-width=\"2.4\"" +
+                " stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M7 6.5 11.6 12 7 17.5\"/><path d=\"M13.4 17.5h4.2\"/></svg></div>" +
+                "<h2>" + title + "</h2>" +
+                "<p><span class=\"dot\"></span>" + sub + "</p>" +
+                "</div></body></html>";
             try { webView.CoreWebView2.NavigateToString(html); } catch { }
         }
 
@@ -2557,7 +2684,7 @@ namespace DshPanel
                         // 胶囊 tooltip：端口 + 运行时长/日志大小
                         try { capsuleTip.SetToolTip(statusCapsule, "端口 " + Program.Port + "\n" + infoText); } catch { }
                         // 托盘状态图标：绿=运行 / 灰=未运行 / 琥珀=启动停止中
-                        Color dotColor = pu ? Theme.Amber : (run ? Theme.Green : Color.FromArgb(148, 163, 184));
+                        Color dotColor = pu ? Theme.Amber : (run ? Theme.Green : Theme.Gray);
                         SetTrayStateIcon(dotColor);
                     }
                     catch { }
@@ -2856,12 +2983,12 @@ namespace DshPanel
         {
             switch (kind)
             {
-                case LogKind.Info: return Color.FromArgb(37, 99, 235);        // 蓝
-                case LogKind.Success: return Color.FromArgb(5, 150, 105);     // 绿
-                case LogKind.Warn: return Color.FromArgb(180, 83, 9);         // 琥珀
-                case LogKind.Error: return Color.FromArgb(220, 38, 38);       // 红
-                case LogKind.ServiceOut: return Color.FromArgb(55, 65, 81);   // 深灰
-                case LogKind.ServiceErr: return Color.FromArgb(185, 28, 28);  // 暗红
+                case LogKind.Info: return Theme.BlueInk;      // 事件：深蓝
+                case LogKind.Success: return Theme.GreenInk;  // 成功：深绿
+                case LogKind.Warn: return Theme.AmberInk;     // 警告：深琥珀
+                case LogKind.Error: return Theme.RedInk;      // 错误：深红
+                case LogKind.ServiceOut: return Theme.Text;   // 服务 stdout：正文色
+                case LogKind.ServiceErr: return Theme.RedInk; // 服务 stderr：深红
             }
             return Theme.TextStrong;
         }
@@ -3278,26 +3405,37 @@ namespace DshPanel
                 g.FillRectangle(bgBrush, 0, 0, Width, Height);
             }
 
-            // 底部 1px 分隔线（柔和浅灰）
-            using (SolidBrush line = new SolidBrush(Color.FromArgb(238, 241, 245)))
+            // 底部 1px 分隔线（冷蓝灰，和卡片边同色系）
+            using (SolidBrush line = new SolidBrush(Theme.Divider))
             {
                 g.FillRectangle(line, 0, Height - 1, Width, 1);
             }
 
-            // Logo
-            Ui.DrawLogo(g, 14, (Height - 26) / 2, 26);
+            // Logo：圆角蓝方块 + 白色提示符
+            int logo = 26;
+            Ui.DrawLogo(g, 16, (Height - logo) / 2, logo);
 
-            // 标题（与 URL 同行，URL 灰色小字紧随）
-            using (Font titleFont = new Font("Segoe UI", 11F, FontStyle.Bold, GraphicsUnit.Point))
+            using (Font titleFont = new Font("Microsoft YaHei UI", 10.5F, FontStyle.Bold, GraphicsUnit.Point))
             using (Font urlFont = new Font("Consolas", 8.5F, GraphicsUnit.Point))
             {
                 TextRenderer.DrawText(g, "DeepSeek Harness Web", titleFont,
-                    new Rectangle(50, 0, Width - 200, Height), Color.FromArgb(31, 41, 55),
+                    new Rectangle(16 + logo + 12, 0, Width - 200, Height), Theme.TextStrong,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                 int tw = TextRenderer.MeasureText(g, "DeepSeek Harness Web", titleFont).Width;
-                TextRenderer.DrawText(g, url, urlFont,
-                    new Rectangle(50 + tw + 16, 0, Width - 200 - tw - 16, Height), Theme.TextFaint,
-                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+
+                // URL 做成浅蓝 chip：小圆角 + 深蓝字，比纯灰小字更有层次
+                string text = url;
+                Size ts = TextRenderer.MeasureText(g, text, urlFont, new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding);
+                int chipX = 16 + logo + 12 + tw + 14;
+                int chipW = Math.Min(Math.Max(64, ts.Width + 20), Math.Max(64, Width - chipX - 12));
+                Rectangle chip = new Rectangle(chipX, (Height - 22) / 2, chipW, 22);
+                if (chip.Right < Width - 8)
+                {
+                    Ui.Chip(g, chip, Theme.BlueSoft, Color.FromArgb(46, Theme.Blue));
+                    TextRenderer.DrawText(g, text, urlFont,
+                        new Rectangle(chip.X + 10, chip.Y, chip.Width - 20, chip.Height), Theme.BlueInk,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.PathEllipsis);
+                }
             }
         }
     }
@@ -3346,23 +3484,27 @@ namespace DshPanel
             // 先铺满父容器底色，圆角外不残留黑块
             Ui.ClearBackground(g, this);
 
-            Color fill = statusColor;
-            if (pressed) fill = Ui.Darken(fill, 0.85F);
-            else if (hovering) fill = Ui.Darken(fill, 0.93F);
+            // 浅色底 + 同色深字 + 实心状态点：不再用大块饱和填充，和整体蓝白调一致
+            Color fill = Ui.Soft(statusColor);
+            Color ink = Ui.Ink(statusColor);
+            if (pressed) fill = Ui.Blend(fill, statusColor, 0.24F);
+            else if (hovering) fill = Ui.Blend(fill, statusColor, 0.13F);
 
-            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), Height / 2))
-            using (SolidBrush brush = new SolidBrush(fill))
-            {
-                g.FillPath(brush, path);
-            }
-            // 状态白点 + 白字
+            Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
+            Ui.FillRound(g, r, -1, fill);
+            Ui.StrokeRound(g, r, -1, Color.FromArgb(88, statusColor), 1F);
+
             int shift = pressed ? 1 : 0;
-            using (SolidBrush dot = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
+            using (SolidBrush halo = new SolidBrush(Color.FromArgb(58, statusColor)))
             {
-                g.FillEllipse(dot, 12, Height / 2 - 3 + shift, 6, 6);
+                g.FillEllipse(halo, 9, Height / 2 - 5 + shift, 10, 10);
+            }
+            using (SolidBrush dot = new SolidBrush(statusColor))
+            {
+                g.FillEllipse(dot, 11, Height / 2 - 3 + shift, 6, 6);
             }
             TextRenderer.DrawText(g, statusText, Font,
-                new Rectangle(24, shift, Width - 28, Height), Color.White,
+                new Rectangle(24, shift, Width - 32, Height), ink,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
     }
@@ -3402,22 +3544,24 @@ namespace DshPanel
             Graphics g = pevent.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            // 轨道：开 = 主题蓝，关 = 灰；悬停略亮
-            Color track = on ? Color.FromArgb(59, 130, 246) : Color.FromArgb(209, 213, 219);
-            if (hovering) track = Ui.Darken(track, 0.92F);
-            Rectangle trackRect = new Rectangle(0, (Height - 16) / 2, Width - 1, 16);
-            using (GraphicsPath path = Ui.RoundedRect(trackRect, 8))
-            using (SolidBrush b = new SolidBrush(track))
-            {
-                g.FillPath(b, path);
-            }
-            // 滑块
-            int pad = 3;
-            int dia = 18;
-            int x = on ? Width - dia - pad : pad;
+            // 轨道：开 = 品牌蓝，关 = 冷蓝灰；两端是完整的半圆
+            Color track = on ? Theme.Blue : Theme.SwitchOff;
+            if (hovering) track = on ? Theme.BlueHover : Theme.SwitchOffHover;
+            int trackH = 18;
+            Rectangle trackRect = new Rectangle(0, (Height - trackH) / 2, Width - 1, trackH);
+            Ui.FillRound(g, trackRect, -1, track);
+
+            // 滑块：白圆 + 1px 半透明边，落在轨道外沿也圆润
+            int pad = 2;
+            int dia = Height - pad * 2;
+            int x = on ? Width - dia - pad - 1 : pad;
             using (SolidBrush knob = new SolidBrush(Color.White))
             {
-                g.FillEllipse(knob, x, (Height - dia) / 2, dia, dia);
+                g.FillEllipse(knob, x, (Height - dia) / 2, dia - 1, dia - 1);
+            }
+            using (Pen ring = new Pen(Color.FromArgb(48, 20, 50, 110), 1F))
+            {
+                g.DrawEllipse(ring, x, (Height - dia) / 2, dia - 1, dia - 1);
             }
         }
     }
@@ -3517,11 +3661,24 @@ namespace DshPanel
             g.SmoothingMode = SmoothingMode.AntiAlias;
             Ui.ClearBackground(g, this);
 
-            Color fill = Enabled ? currentColor : Ui.Darken(currentColor, 0.72F);
-            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), Theme.RadiusButton))
-            using (SolidBrush brush = new SolidBrush(fill))
+            Color fill = Enabled ? currentColor : Ui.Blend(Ui.Soft(currentColor), Theme.BorderStrong, 0.35F);
+            Color fg = Enabled ? Color.White : Ui.Ink(Theme.Gray);
+            Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
+            Ui.FillRound(g, r, Theme.RadiusButton, fill);
+
+            // 顶部一道微高光，让平色块有一点体积感（不改变主色）
+            if (Enabled)
             {
-                g.FillPath(brush, path);
+                Rectangle hiRect = new Rectangle(r.X, r.Y, r.Width, Math.Max(6, r.Height / 2));
+                using (GraphicsPath hiPath = Ui.RoundedRect(hiRect, Theme.RadiusButton))
+                using (SolidBrush hi = new SolidBrush(Color.FromArgb(26, 255, 255, 255)))
+                {
+                    g.FillPath(hi, hiPath);
+                }
+            }
+            if (pressed)
+            {
+                Ui.FillRound(g, r, Theme.RadiusButton, Color.FromArgb(20, 0, 0, 0));
             }
 
             int shift = pressed ? 1 : 0;
@@ -3538,19 +3695,11 @@ namespace DshPanel
 
                 if (icon != ButtonIcon.None)
                 {
-                    Ui.DrawButtonIcon(g, icon, startX + iconW / 2, cy, Color.White);
+                    Ui.DrawButtonIcon(g, icon, startX + iconW / 2, cy, fg);
                 }
                 TextRenderer.DrawText(g, Text, f,
-                    new Rectangle(startX + iconW + gap, shift, tw + 4, Height), Color.White,
+                    new Rectangle(startX + iconW + gap, shift, tw + 4, Height), fg,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-            }
-
-            if (!Enabled)
-            {
-                using (SolidBrush dim = new SolidBrush(Color.FromArgb(120, 255, 255, 255)))
-                {
-                    g.FillRectangle(dim, ClientRectangle);
-                }
             }
         }
     }
@@ -3593,24 +3742,35 @@ namespace DshPanel
 
             Color bg;
             Color fg;
+            Color border;
             if (isOn)
             {
-                bg = Color.FromArgb(219, 234, 254);    // 淡蓝底 = 开关开启
-                fg = Color.FromArgb(30, 64, 175);
+                bg = Theme.BlueSoft;                   // 处于开启态
+                fg = Theme.BlueInk;
+                border = Color.FromArgb(70, Theme.Blue);
+            }
+            else if (pressed)
+            {
+                bg = Theme.BlueSoft;
+                fg = Theme.BlueInk;
+                border = Color.FromArgb(52, Theme.Blue);
+            }
+            else if (hovering)
+            {
+                bg = Theme.BlueSoftHover;
+                fg = Theme.BlueInk;
+                border = Color.FromArgb(44, Theme.Blue);
             }
             else
             {
-                bg = pressed ? Color.FromArgb(203, 213, 225)
-                     : hovering ? Color.FromArgb(226, 232, 240)
-                     : Color.FromArgb(238, 242, 247);
-                fg = Color.FromArgb(71, 85, 105);
+                bg = Theme.Card;
+                fg = Theme.TextMuted;
+                border = Theme.Border;
             }
 
-            using (GraphicsPath path = Ui.RoundedRect(new Rectangle(0, 0, Width - 1, Height - 1), Theme.RadiusSmall))
-            using (SolidBrush brush = new SolidBrush(bg))
-            {
-                g.FillPath(brush, path);
-            }
+            Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
+            Ui.FillRound(g, r, Theme.RadiusSmall, bg);
+            Ui.StrokeRound(g, r, Theme.RadiusSmall, border, 1F);
             TextRenderer.DrawText(g, Text, Font, ClientRectangle, fg,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
@@ -3632,18 +3792,7 @@ namespace DshPanel
             Ui.ClearBackground(g, this);
 
             Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
-
-            // 底部轻投影（两圈半透明）
-            using (GraphicsPath shadow = Ui.RoundedRect(new Rectangle(1, 2, Width - 3, Height - 3), Theme.RadiusCard))
-            using (SolidBrush sb = new SolidBrush(Color.FromArgb(10, 15, 23, 42)))
-            {
-                g.FillPath(sb, shadow);
-            }
-            using (GraphicsPath shadow = Ui.RoundedRect(new Rectangle(0, 1, Width - 1, Height - 1), Theme.RadiusCard))
-            using (SolidBrush sb = new SolidBrush(Color.FromArgb(7, 15, 23, 42)))
-            {
-                g.FillPath(sb, shadow);
-            }
+            Ui.DrawSoftCard(g, r, Theme.RadiusCard);
 
             using (GraphicsPath path = Ui.RoundedRect(r, Theme.RadiusCard))
             using (SolidBrush brush = new SolidBrush(Theme.Card))
