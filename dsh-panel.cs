@@ -73,6 +73,11 @@
 //       但三处检测入口各自 QueuedUserWorkItem、没有任何一处负责刷新设置页标签。现在统一走
 //       BeginDshCheck()：防重入（连点不会起一堆 PowerShell）、检测中禁用按钮、结果回来时
 //       通过 RefreshDshStatusLabels() 刷新标签；连点与「检测中」态都有了明确表现。
+// v3.7.2（按钮去边框）：顶栏「工作台 / 设置」和状态胶囊从 Button 改成自绘 Control——
+//       Button 即使 FlatStyle=Flat + BorderSize=0，窗口重新激活 / 高 DPI 重绘时仍可能露出
+//       系统画的方形外框（鼠标移上去被我们的填充盖住，于是"悬停就消失"）。自绘 Control 没有
+//       FlatAppearance/BorderStyle 这类属性，且常态**既无边框也无底色**（只有文字，悬停浮出
+//       浅蓝底），从根上杜绝这类方框；Click 由 OnMouseUp 自己发（StandardClick 关掉，避免重复）。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -96,8 +101,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.7.1.0")]
-[assembly: AssemblyFileVersion("3.7.1.0")]
+[assembly: AssemblyVersion("3.7.2.0")]
+[assembly: AssemblyFileVersion("3.7.2.0")]
 
 namespace DshPanel
 {
@@ -3477,7 +3482,7 @@ namespace DshPanel
 
     // ---------- 服务状态胶囊（顶栏：圆角填充 + 白字，点击启停） ----------
 
-    class StatusCapsule : Button
+    class StatusCapsule : Control
     {
         string statusText = "未运行";
         Color statusColor = Theme.Red;
@@ -3489,12 +3494,17 @@ namespace DshPanel
 
         public StatusCapsule()
         {
-            FlatStyle = FlatStyle.Flat;
-            FlatAppearance.BorderSize = 0;
+            // v3.7.2：从 Button 改成自绘 Control —— Button 即使 FlatStyle=Flat + BorderSize=0，
+            // 在窗口重新激活 / 高 DPI 重绘时仍可能露出系统画的方框；自绘 Control 没有
+            // FlatAppearance/BorderStyle 这类属性，也就没有任何系统边框可漏。
             Font = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Bold);
             Cursor = Cursors.Hand;
+            TabStop = false;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
-                ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                ControlStyles.UserPaint | ControlStyles.ResizeRedraw |
+                ControlStyles.SupportsTransparentBackColor, true);
+            SetStyle(ControlStyles.StandardClick, false);   // Click 由自己发，避免与基类重复
+            SetStyle(ControlStyles.Selectable, false);
         }
 
         public void SetStatus(string text, Color color)
@@ -3508,8 +3518,19 @@ namespace DshPanel
 
         protected override void OnMouseEnter(EventArgs e) { hovering = true; Invalidate(); base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { hovering = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
-        protected override void OnMouseDown(MouseEventArgs mevent) { pressed = true; Invalidate(); base.OnMouseDown(mevent); }
-        protected override void OnMouseUp(MouseEventArgs mevent) { pressed = false; Invalidate(); base.OnMouseUp(mevent); }
+        protected override void OnMouseDown(MouseEventArgs mevent)
+        {
+            if (mevent.Button == MouseButtons.Left) { pressed = true; Invalidate(); }
+            base.OnMouseDown(mevent);
+        }
+        protected override void OnMouseUp(MouseEventArgs mevent)
+        {
+            bool fire = pressed && mevent.Button == MouseButtons.Left && ClientRectangle.Contains(mevent.Location);
+            pressed = false;
+            Invalidate();
+            base.OnMouseUp(mevent);
+            if (fire) OnClick(EventArgs.Empty);
+        }
 
         protected override void OnPaint(PaintEventArgs pevent)
         {
@@ -3741,7 +3762,7 @@ namespace DshPanel
 
     // ---------- 小号扁平按钮（日志工具栏） ----------
 
-    class SmallButton : Button
+    class SmallButton : Control
     {
         bool hovering;
         bool pressed;
@@ -3755,19 +3776,34 @@ namespace DshPanel
 
         public SmallButton(string text)
         {
+            // v3.7.2：Button → 自绘 Control；常态**既没有边框也没有底色**，只有文字，
+            // 悬停/按下/开启时才浮出浅蓝底。这样任何"方框"都不可能再出现。
             Text = text;
-            FlatStyle = FlatStyle.Flat;
-            FlatAppearance.BorderSize = 0;
             Font = new Font("Microsoft YaHei UI", 8.5F, GraphicsUnit.Point);
             Cursor = Cursors.Hand;
+            TabStop = false;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
-                ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+                ControlStyles.UserPaint | ControlStyles.ResizeRedraw |
+                ControlStyles.SupportsTransparentBackColor, true);
+            SetStyle(ControlStyles.StandardClick, false);
+            SetStyle(ControlStyles.Selectable, false);
         }
 
         protected override void OnMouseEnter(EventArgs e) { hovering = true; Invalidate(); base.OnMouseEnter(e); }
         protected override void OnMouseLeave(EventArgs e) { hovering = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
-        protected override void OnMouseDown(MouseEventArgs mevent) { pressed = true; Invalidate(); base.OnMouseDown(mevent); }
-        protected override void OnMouseUp(MouseEventArgs mevent) { pressed = false; Invalidate(); base.OnMouseUp(mevent); }
+        protected override void OnMouseDown(MouseEventArgs mevent)
+        {
+            if (mevent.Button == MouseButtons.Left) { pressed = true; Invalidate(); }
+            base.OnMouseDown(mevent);
+        }
+        protected override void OnMouseUp(MouseEventArgs mevent)
+        {
+            bool fire = pressed && mevent.Button == MouseButtons.Left && ClientRectangle.Contains(mevent.Location);
+            pressed = false;
+            Invalidate();
+            base.OnMouseUp(mevent);
+            if (fire) OnClick(EventArgs.Empty);
+        }
 
         protected override void OnPaint(PaintEventArgs pevent)
         {
@@ -3775,37 +3811,18 @@ namespace DshPanel
             g.SmoothingMode = SmoothingMode.AntiAlias;
             Ui.ClearBackground(g, this);
 
-            Color bg;
+            // 常态：只有文字（无底色、无边框）；悬停/按下/开启：浅蓝底 + 深蓝字
+            bool filled = isOn || hovering || pressed;
             Color fg;
-            Color border;
-            if (isOn)
-            {
-                bg = Theme.BlueSoft;                   // 处于开启态
-                fg = Theme.BlueInk;
-                border = Color.FromArgb(70, Theme.Blue);
-            }
-            else if (pressed)
-            {
-                bg = Theme.BlueSoft;
-                fg = Theme.BlueInk;
-                border = Color.FromArgb(52, Theme.Blue);
-            }
-            else if (hovering)
-            {
-                bg = Theme.BlueSoftHover;
-                fg = Theme.BlueInk;
-                border = Color.FromArgb(44, Theme.Blue);
-            }
-            else
-            {
-                bg = Theme.Card;
-                fg = Theme.TextMuted;
-                border = Theme.Border;
-            }
+            if (isOn || pressed) fg = Theme.BlueInk;
+            else if (hovering) fg = Theme.BlueInk;
+            else fg = Enabled ? Theme.TextMuted : Theme.TextFaint;
 
-            Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
-            Ui.FillRound(g, r, Theme.RadiusSmall, bg);
-            Ui.StrokeRound(g, r, Theme.RadiusSmall, border, 1F);
+            if (filled)
+            {
+                Color bg = isOn ? Theme.BlueSoft : (pressed ? Theme.BlueSoft : Theme.BlueSoftHover);
+                Ui.FillRound(g, new Rectangle(0, 0, Width, Height), Theme.RadiusSmall, bg);
+            }
             TextRenderer.DrawText(g, Text, Font, ClientRectangle, fg,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
