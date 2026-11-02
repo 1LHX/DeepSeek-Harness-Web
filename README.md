@@ -63,7 +63,7 @@ v3.5 起顶栏多一个「工作台」（快捷键 F2）：文件、终端、任
 | **工作台（v3.5）** | |
 | `workbench/ui.html` | 工作台界面（单文件 HTML+CSS+JS，构建时内嵌进 exe，运行时注入 DSH 页面） |
 | `workbench/session-reader.mjs` | 会话事件流边车：解 zstd 帧、抽轮次卡（turn/start|end + tool/call）、todo 清单、排队消息（任务看板的数据源；缺失时其余页签照常用） |
-| `workbench/smoke.mjs` | 工作台自动化冒烟（CDP 驱动：挂载/桥接/五页签/轮次卡/抽屉宽度/终端策略/编辑-应用-回滚，20 项；需临时打开 `debugport`） |
+| `workbench/smoke.mjs` | 工作台自动化冒烟（CDP 驱动：挂载/桥接/五页签/轮次卡/抽屉宽度/终端策略/编辑-应用-回滚，21 项；需临时打开 `debugport`） |
 | `update-dsh.ps1` | 检查/升级 DeepSeek Harness 本体：按版本取当前、npm 取最新、备份会话、`npx --yes @deepseek-ai/dsh@<版本>` 预热、写 `run/update-*.txt` |
 | `update-plugins.ps1` | 更新 web profile 下的插件（`dsh plugin --profile web update`），结果写 `run/update-plugins.txt` |
 | **构建与测试** | |
@@ -73,7 +73,7 @@ v3.5 起顶栏多一个「工作台」（快捷键 F2）：文件、终端、任
 | `run-tests.cmd` | 门禁 → 编译 → GUI 冒烟三步（不动正在运行的服务） |
 | **服务启停** | |
 | `start-service.ps1` | 后台启动服务（唯一权威：试次阶梯、端口顺延、npx 兜底、失败现场保留） |
-| `dsh-launch.mjs` | **快启动路径**：面板优先用它直连 `node bin.js`（省掉 PowerShell 冷启动 ~1.4 s）；任何意外同步转交 `start-service.ps1` |
+| `dsh-launch.mjs` | **快启动路径**：面板优先用它直连 `node bin.js`（省掉 PowerShell 冷启动 ~1.4 s）；任何意外同步转交 `start-service.ps1`；`--print-entry` 只打印按规则选中的入口/版本，`--no-delegate` 只跑快路径，均用于诊断 |
 | `stop-dsh.cmd` | 命令行停止服务，支持 `--dry-run` 预览 |
 | `check-dsh.ps1` | 检测 @deepseek-ai/dsh 是否可用（文件系统优先，npm 仅兜底），结果写 run/dsh-check.txt |
 | `check-update.ps1` | 比对已装 dsh 与 npm 最新版（24 小时节流），结果写 run/update-check.txt |
@@ -83,7 +83,7 @@ v3.5 起顶栏多一个「工作台」（快捷键 F2）：文件、终端、任
 | `start-remote.cmd` / `start-remote.ps1` | 令牌鉴权的远程/局域网入口（前台运行，关窗口即收回） |
 | `remote-proxy.mjs` | 代理本体：HTTP + WebSocket 透传、口令校验、内网来源限制 |
 | **诊断与维护** | |
-| `check-boot-perf.ps1` | 启动耗时诊断（只读，`-BootTest` 会在 3099 端口真实引导一次） |
+| `check-boot-perf.ps1` | 启动耗时诊断（默认只读；`-BootTest` 会在 3099 端口临时引导一次，不碰 3080） |
 | `show-timing.cmd` | **cmd 里直接跑**的分段耗时速查（不用 PowerShell）：最后一条 PORT READY、面板打点、入口/降级、排除项状态 |
 | `clean-npx-cache.ps1` | 清理 npx 缓存历史目录（默认演练，`-Apply` 才删） |
 | `defender-exclusions.ps1` | Defender 排除路径管理（**只针对 `npm-cache\_npx` 一条**；`-Add` / `-Remove` / `-Status` / `-DryRun`，结果写 `run/defender-exclusions.log`） |
@@ -101,7 +101,7 @@ dsh-web/
 ├── workbench/                                     工作台三件套
 │   ├── ui.html                                    界面（构建时内嵌进 exe，运行时注入 DSH 页面）
 │   ├── session-reader.mjs                         会话事件流边车（任务看板的数据来源）
-│   └── smoke.mjs                                    CDP 冒烟（17 项，需临时开 debugport）
+│   └── smoke.mjs                                    CDP 冒烟（21 项，需临时开 debugport）
 ├── lib/                                           内嵌浏览器 SDK（WebView2，随仓库提交）
 ├── hooks/compile-cache.mjs                        可选 V8 编译缓存钩子
 ├── build-dsh-panel.cmd / apply-panel-update.cmd   构建 / 改码后重建并重启面板
@@ -125,6 +125,20 @@ dsh-web/
 ```
 
 运行时产物与源码分离（v1.4 起）；旧版本留在根目录的日志/PID 会在面板启动时自动迁移。
+
+## 代码分层
+
+| 层 | 位置 | 职责 |
+|---|---|---|
+| 面板 | `dsh-panel.cs` | 窗口 / 托盘 / 顶栏、服务生命周期、WebView2 导航、设置页 |
+| 工作台桥接 | `dsh-workbench.cs` | 唯一允许起进程的层：文件、终端、git、变更、会话边车 |
+| 工作台前端 | `workbench/` | 注入 UI（`ui.html`）、会话事件流边车、CDP 冒烟 |
+| 可选钩子 | `hooks/` | V8 编译缓存（仅 `compilecache=1` 时使用） |
+| 内嵌浏览器 SDK | `lib/` | 随仓库提交的 WebView2 托管程序集 + loader |
+| 入口脚本 | 根目录 `.cmd` / `.ps1` | 双击入口与服务启停；**保持平铺**（路径被面板、文档、快捷方式引用） |
+
+新增内部实现请放进对应子目录；根目录只放「用户会双击」或「被其他脚本按固定路径调用」的入口，
+避免再出现「文件说明里有、目录结构里没有」的漂移。
 
 ## 构建
 
@@ -154,7 +168,7 @@ run-tests.cmd    # 门禁 + 编译 + 面板 GUI 冒烟（不触碰正在运行�
 
 ```bat
 :: 1) 先在 dsh-web.config 里临时打开 debugport=9222，重启面板
-node workbench\smoke.mjs        :: 20 项：挂载 / 桥接 / 五页签 / 轮次卡 / 抽屉宽度 / 终端策略 / 编辑-应用-回滚 / Git
+node workbench\smoke.mjs        :: 21 项：挂载 / 桥接 / 五页签 / 轮次卡 / 抽屉宽度 / 终端策略 / 编辑-应用-回滚 / Git
 :: 2) 验完把 debugport 注释掉，再重启面板
 ```
 
@@ -280,6 +294,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File check-boot-perf.ps1 -BootTes
 
 只读；`-BootTest` 会在 3099 端口真实引导一次并自动结束，不碰正在运行的服务。
 结果与 `run/boot-timing.log` 对照即可判断瓶颈在哪一段。
+0.2.x 的页面需要 launch token：脚本会从 `logs/dsh-web.log` 取最近一条地址做前端取样；
+插件 bundle 只计数、不下载（两个插件 URL 合计 >10 MB），避免诊断本身变成大流量操作。
+npx 探测使用 `--no-install`：缓存命中才有结果，未命中快速失败，**不会因为诊断而安装/刷新缓存**。
 
 ## 可靠性（v3.3）
 
@@ -628,24 +645,25 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 
 | 版本 | 要点 |
 |---|---|
-| v1.4 | 运行时产物目录化（logs/ run/）、run-tests、README 结构说明 |
-| v1.5 | 活动日志面板：时间戳着色事件流 + 工具栏（清空/复制/打开目录/自动滚动）+ 运行信息行 |
-| v2.0 | 内嵌 WebView2 网页视图：控制台/网页标签、服务就绪自动导航、占位页；修复 selftest 的 Job 绑定失效 |
-| v3.0 | 网页化 UI：打开即自动启动服务并最大化显示内嵌网页；40px 顶栏（Logo/URL/导航/状态胶囊/日志）；日志独立弹窗；窗口恢复最大化 |
-| v3.1 | 顶栏精简（去导航按钮）+ 设置页（偏好开关持久化、DSH 状态与重新检测、关于）+ 启动时 DSH 可用性检测与安装指引页 |
-| v3.1.1 | 优化：检测不再读旧缓存、PID 上限放宽、stop-dsh 注释过滤、端口文案动态化；删除死代码（StatusLine 等）；开关重绘为胶囊拨动开关、清除浏览器缓存、检测超时提示、胶囊 tooltip、设置页浏览器端口检查；UI 圆角体系统一 |
-| v3.2 | 启动提速：start-service 直连 node bin.js（npx 兜底）+ 启动分段打点 + 试次阶梯与失败现场保留；`--port` 显式传递（修掉 config 端口不生效的隐患）；面板启动与依赖检测并行、过渡期 300ms 轮询；可选 V8 编译缓存钩子（实测无收益，默认关）；新增 defender-exclusions / clean-npx-cache / check-boot-perf / apply-panel-update |
-| v3.3 | 可靠性：端口冲突自动顺延 + 面板按 PID 校验采纳真实端口 + 重复启动直接复用；崩溃自动恢复改指数退避（5→300 秒）并以「连续健康 120 秒」复位；HTTP 健康检查（绕过代理，仅观测不重启）；日志被占用时自动改名；stop-dsh/check-boot-perf 跟随实际端口；新增更新提示（check-update.ps1，只提示不自动升级）与令牌鉴权的远程访问（start-remote.cmd + remote-proxy.mjs，HTTP+WebSocket 透传，默认关闭） |
-| v3.4.1 | 端口采纳收紧：`SyncActivePort` 现在**必须**有可验证的 pid 才采纳 `run/dsh-web.port`（此前 pid 读不到时只要求端口在监听，「残留 port 文件 + 别的程序占了该端口」会让内嵌浏览器导航到别人的服务）；pid 文件失效时一并删除端口记录。新增 `check-scripts.ps1` 编码/语法门禁并接入 `run-tests.cmd` 第一步 |
+| v3.9.3 | **结构与文档一致性**：入口定位统一为「按版本最高」——`start-service.ps1` / `dsh-launch.mjs` / `check-boot-perf.ps1` 与面板、`update-dsh.ps1` 使用同一套版本比较规则（mtime 只做同版本平局），避免被 touch 过的旧缓存抢到启动权；`check-boot-perf.ps1` 的 node 旁入口路径修正为 node.exe 同目录，并显示选中的版本；前端取样改用日志里的 launch token（0.2.x 不再在诊断里报 401），插件 bundle 只计数不下载，npx 探测改用 `--no-install`（诊断不再改缓存）；Defender 建议收敛为只排除 `_npx`；`dsh-launch.mjs` 新增 `--print-entry` 诊断（只打印入口/版本，不启动服务）；README 版本表按版本倒序整理、冒烟项数改为代码里实际的 21 项；`dsh-web.config` 的 `compilecache` 恢复默认关闭（实测无收益） |
 | v3.9.2 | **只开软件内页面 + 浏览器按钮**：dsh 0.2.x 的 `dsh web` 默认会在端口就绪时自己打开系统浏览器，与面板内嵌页面叠成「软件内 + 浏览器内」两个窗口。启动链路（`dsh-launch.mjs` / `start-service.ps1`）现按已装版本给 `web` 传 `--no-open`（0.1.x 不认识该开关，保持原行为；`check-boot-perf.ps1 -BootTest` 同步处理）；顶栏新增「浏览器」按钮（托盘/设置页入口保留），按需打开当前页面，并复用 `ResolveNavUrl()` 取带 launch token 的地址，0.2.x 不会被鉴权页挡住。**同版修掉任务页闪烁**：`session-reader.mjs` 原先只认旧的 `session.jsonl.zstd`，读不到 0.2.x 的 `session.v4.jsonl.zstd`，会在旧会话之间来回绑定（已完成数 9/17 闪动、列内容忽有忽无）；现在两种文件名都认，坏帧只跳过一次而不是每 800ms 重读整个文件（后者也是任务页 CPU 占用的来源）；任务看板的 DOM 重建合并到 200ms 一次（一轮对话上千条工具事件不再逐条重绘） |
 | v3.9.1 | **「更新插件」修好**：脚本先读 profile 的 `dependencies`（为空 → `note=no-plugins` 直接返回，不启动 pnpm、不造 `node_modules`/`pnpm-lock.yaml`），pnpm 预检给出可执行提示（dsh 的 `pnpm was not found` 挂在 exit 127，Windows cmd 返回 1，永远打不出来），入口从「mtime 最新」改成「**版本号最高**」（与启动器/面板/`update-dsh.ps1` 一致），加 600s 硬超时与 `detail=` 诊断字段；面板侧点下去立刻切「更新中…」、复用进度窗口看 `run/update-plugins.log`、成功后问是否重启，并把 `ERR_PNPM_FETCH_404`／`allow-version` 提示带进弹窗 |
 | v3.9 | **升级可见 + 0.2.x 鉴权**：升级时弹进度窗口（marquee 进度条 + 已用秒数 + `run/update-apply.log` 实时尾部，「在后台继续」只隐藏不中断），「检查更新」立刻切「检查中…」；`dsh 0.2.x` 新增浏览器会话鉴权，面板改从 `logs/dsh-web.log` 解析带 launch token 的地址导航（`ResolveNavUrl`），被挡下时自动重读令牌重试（≤2 次/代），顶栏与日志只写裸地址；顺手修掉自绘 `SmallButton` 因缺 `SingleLine` 在窄列/高 DPI 下把「检查更新」折成两行叠字的问题（并给更新区按钮加 `AutoWidth` 按文字测宽） |
-| v3.8 | **更新 DSH**：启动自动查新版（12 秒后、24h 节流），有新版在顶栏「设置」按钮右上角**亮红点** + 托盘气泡；设置页新增「DeepSeek Harness 更新」分区（当前/最新/上次检查 + 检查更新 / 更新到最新版 / 更新插件）。升级本体走新脚本 `update-dsh.ps1`（npx 显式 `@<版本>` 预热、先备份 `~/.dsh/sessions`、结果写 `run/update-check.txt`、过程写 `run/update-apply.log`，脚本不重启服务，成功后由面板询问重启）；插件走 `update-plugins.ps1`（`dsh plugin --profile web update`）。`check-update.ps1` 增加版本比较与 `-WithTags`；启动器/面板/启动器的入口定位由「mtime 最新」改为「**版本最高**」 |
+| v3.8 | **更新 DSH**：启动自动查新版（12 秒后、24h 节流），有新版在顶栏「设置」按钮右上角**亮红点** + 托盘气泡；设置页新增「DeepSeek Harness 更新」分区（当前/最新/上次检查 + 检查更新 / 更新到最新版 / 更新插件）。升级本体走新脚本 `update-dsh.ps1`（npx 显式 `@<版本>` 预热、先备份 `~/.dsh/sessions`、结果写 `run/update-check.txt`、过程写 `run/update-apply.log`，脚本不重启服务，成功后由面板询问重启）；插件走 `update-plugins.ps1`（`dsh plugin --profile web update`）。`check-update.ps1` 增加版本比较与 `-WithTags`；启动器 / start-service / check-boot-perf / 面板的入口定位由「mtime 最新」改为「**版本最高**」 |
 | v3.7.2 | 修掉顶栏「工作台 / 设置」按钮外面的**方形外框**（鼠标移上去又消失）：把这两个按钮和状态胶囊从 `Button` 改成自绘 `Control`——`Button` 即使 `FlatStyle=Flat` + `BorderSize=0`，在窗口重新激活或高 DPI 重绘时仍可能露出系统画的方框；自绘 `Control` 没有 `FlatAppearance`/`BorderStyle` 这类属性，且常态**既无边框也无底色**（只有文字，悬停才浮出浅蓝底）。`Click` 由 `OnMouseUp` 自己发（关掉 `StandardClick` 防重复），已用真实鼠标点击验证「设置」仍能打开设置页 |
 | v3.7.1 | 修复设置页「重新检测」点了之后一直停在「检测中…」：检测本身 1 秒就返回（`run/dsh-check.txt` 写入 `installed`），但三处检测入口各写一遍、没有一处刷新设置页标签。现在统一走 `BeginDshCheck()`——防重入（连点不再起一堆 PowerShell）、检测中把按钮置灰并显示「检测中…」、结果回来经 `RefreshDshStatusLabels()` 刷新标签；已用 UI 自动化真点一次验证：`已就绪 → 检测中… → 已就绪` |
 | v3.7 | **界面统一**：整套 UI 收敛到蓝 + 白单一色系与大圆角——`Theme` 重写（品牌蓝 #2F6BFF、浅蓝底/深蓝字、冷蓝灰线与四级文字），顶栏白底 + 蓝色品牌标 + URL 浅蓝 chip，状态胶囊改成「浅底 + 同色深字 + 实心点」，按钮/开关/卡片/输入框统一圆角与边框，占位页与工作台同步换色；应用图标、Header Logo、托盘图标、工作台品牌标统一成同一枚「›_」标记（圆头线段、无尖角）；新增「界面设计规范」一节 |
 | v3.6 | **工作台二轮**：任务看板改成「轮次卡」骨架（每轮对话一张卡，目标取你的消息，带工具数/用时/最近工具），Agent 的 todo 清单与排队消息叠在上面，修掉「待规划 / 进行中永远为空」；清单超 2 分钟未更新时提示以轮次卡为准；抽屉**宽度可拖拽**（双击复位、localStorage 记忆）、遮罩不再拦点击；修掉页签徽章用错根节点导致一直不更新的问题；冒烟扩到 20 项 |
 | v3.5 | **工作台**：顶栏「工作台」+ 抽屉界面（`workbench/ui.html`，Shadow DOM 注入 DSH 页面，F2）：文件树/预览/搜索 + **@ 引用直接插入 DSH 输入框**、内嵌终端（PowerShell/cmd，命令白名单 + 危险命令二次确认 + 输出上限 + cwd 跟随 + 停止）、**任务看板**（会话事件流边车 `session-reader.mjs` 解 zstd 帧读 `todo/write`/`goal/change`/`tool/call`，三列 + 活动流）、变更审阅（基线快照 + 行级 diff + 接受/回滚/预览后 Apply）、Git 视图（分支/提交/未提交变更/diff）。桥接集中在 `dsh-workbench.cs`（唯一允许起进程的地方，路径锁工作区、策略在 C# 侧）；构建内嵌 UI 资源；门禁新增 ui.html 分节标记/UTF-8 与 exe 内嵌资源检查；可选 `debugport` 供 CDP 巡检 |
 | v3.4.2 | 门禁加固：`-Fast` 模式、空转保护（`-MinFiles`）、源码/exe 版本一致性、PS 5.1 缺失时的显式降级告警；`apply-panel-update.cmd` 在**关面板之前**先跑门禁；面板新增启动自检（纯 .NET 字节检查，`run/boot-timing.log` 记 `selfcheck:`）——即使没人跑门禁，编码/版本问题也会当场上报 |
+| v3.4.1 | 端口采纳收紧：`SyncActivePort` 现在**必须**有可验证的 pid 才采纳 `run/dsh-web.port`（此前 pid 读不到时只要求端口在监听，「残留 port 文件 + 别的程序占了该端口」会让内嵌浏览器导航到别人的服务）；pid 文件失效时一并删除端口记录。新增 `check-scripts.ps1` 编码/语法门禁并接入 `run-tests.cmd` 第一步 |
+| v3.3 | 可靠性：端口冲突自动顺延 + 面板按 PID 校验采纳真实端口 + 重复启动直接复用；崩溃自动恢复改指数退避（5→300 秒）并以「连续健康 120 秒」复位；HTTP 健康检查（绕过代理，仅观测不重启）；日志被占用时自动改名；stop-dsh/check-boot-perf 跟随实际端口；新增更新提示（check-update.ps1，只提示不自动升级）与令牌鉴权的远程访问（start-remote.cmd + remote-proxy.mjs，HTTP+WebSocket 透传，默认关闭） |
+| v3.2 | 启动提速：start-service 直连 node bin.js（npx 兜底）+ 启动分段打点 + 试次阶梯与失败现场保留；`--port` 显式传递（修掉 config 端口不生效的隐患）；面板启动与依赖检测并行、过渡期 300ms 轮询；可选 V8 编译缓存钩子（实测无收益，默认关）；新增 defender-exclusions / clean-npx-cache / check-boot-perf / apply-panel-update |
+| v3.1.1 | 优化：检测不再读旧缓存、PID 上限放宽、stop-dsh 注释过滤、端口文案动态化；删除死代码（StatusLine 等）；开关重绘为胶囊拨动开关、清除浏览器缓存、检测超时提示、胶囊 tooltip、设置页浏览器端口检查；UI 圆角体系统一 |
+| v3.1 | 顶栏精简（去导航按钮）+ 设置页（偏好开关持久化、DSH 状态与重新检测、关于）+ 启动时 DSH 可用性检测与安装指引页 |
+| v3.0 | 网页化 UI：打开即自动启动服务并最大化显示内嵌网页；40px 顶栏（Logo/URL/导航/状态胶囊/日志）；日志独立弹窗；窗口恢复最大化 |
+| v2.0 | 内嵌 WebView2 网页视图：控制台/网页标签、服务就绪自动导航、占位页；修复 selftest 的 Job 绑定失效 |
+| v1.5 | 活动日志面板：时间戳着色事件流 + 工具栏（清空/复制/打开目录/自动滚动）+ 运行信息行 |
+| v1.4 | 运行时产物目录化（logs/ run/）、run-tests、README 结构说明 |
 
 > 版本号以程序集版本（dsh-panel.cs 顶部 `AssemblyVersion`）为准。

@@ -15,6 +15,7 @@
 // 用法（由面板调用，也可手动诊断）：
 //   node dsh-launch.mjs
 //   node dsh-launch.mjs --no-delegate    只跑快路径，失败直接退出（调试用）
+//   node dsh-launch.mjs --print-entry    按实际规则选出入口并打印，不启动服务（诊断用）
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -31,6 +32,7 @@ const PORT_FILE = path.join(RUN, 'dsh-web.port');
 const HOOK = path.join(ROOT, 'hooks', 'compile-cache.mjs');
 const CACHE_DIR = path.join(RUN, 'node-compile-cache');
 const NO_DELEGATE = process.argv.includes('--no-delegate');
+const PRINT_ENTRY = process.argv.includes('--print-entry');
 const WAIT_MS = 120000;
 
 const startedAt = Date.now();
@@ -151,8 +153,48 @@ function portOpen(port, timeoutMs = 300) {
   });
 }
 
-// ---------- 入口定位（与 start-service.ps1 的 Resolve-DshBinJs 同序） ----------
+// ---------- dsh 版本：入口定位与 --no-open 判断共用 ----------
+//
+// 与 dsh-panel.cs 的 CompareDshVersion / update-dsh.ps1 的 ConvertTo-VersionKey
+// 同一套规则：数字段优先；同号时正式版比预发布版新；预发布版之间按尾部数字比。
+// 例：0.1.0-rc.7 < 0.2.1-rc.5 < 0.2.1。
+function readDshVersion(binJs) {
+  try {
+    const pkgPath = path.join(path.dirname(binJs), '..', 'package.json');
+    const version = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version;
+    return typeof version === 'string' ? version : null;
+  } catch { return null; }
+}
 
+function compareDshVersion(a, b) {
+  const parse = (value) => {
+    if (!value) return null;
+    const text = String(value);
+    const dash = text.indexOf('-');
+    const main = dash >= 0 ? text.slice(0, dash) : text;
+    const pre = dash >= 0 ? text.slice(dash + 1) : '';
+    const nums = main.split('.').slice(0, 3).map((n) => Number.parseInt(n, 10) || 0);
+    while (nums.length < 3) nums.push(0);
+    const tail = pre ? /([0-9]+)$/.exec(pre) : null;
+    return { nums, pre: pre ? 1 : 0, preNum: tail ? Number.parseInt(tail[1], 10) || 0 : 0 };
+  };
+  const ka = parse(a);
+  const kb = parse(b);
+  if (!ka && !kb) return 0;
+  if (!ka) return -1;
+  if (!kb) return 1;
+  for (let i = 0; i < 3; i++) {
+    if (ka.nums[i] !== kb.nums[i]) return ka.nums[i] < kb.nums[i] ? -1 : 1;
+  }
+  if (ka.pre !== kb.pre) return ka.pre < kb.pre ? 1 : -1;
+  if (ka.preNum !== kb.preNum) return ka.preNum < kb.preNum ? -1 : 1;
+  return 0;
+}
+
+// ---------- 入口定位（与 start-service.ps1 的 Resolve-DshBinJs 同序） ----------
+//
+// 按版本号取最高，mtime 只用于同版本的平局。npx 缓存里常同时躺着 rc.6 / rc.7，
+// 旧副本被 touch 一下就会比新版本"更新"，按 mtime 选会静默退回旧版本。
 function resolveBinJs() {
   const candidates = [];
   const npxRoot = path.join(process.env.LOCALAPPDATA ?? '', 'npm-cache', '_npx');
@@ -166,11 +208,18 @@ function resolveBinJs() {
   candidates.push(path.join(path.dirname(process.execPath), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
 
   let best = null;
+  let bestVer = null;
   let bestTime = -1;
   for (const candidate of candidates) {
     try {
       const stat = fs.statSync(candidate);
-      if (stat.isFile() && stat.mtimeMs > bestTime) { best = candidate; bestTime = stat.mtimeMs; }
+      if (!stat.isFile()) continue;
+      const ver = readDshVersion(candidate);
+      if (!best) { best = candidate; bestVer = ver; bestTime = stat.mtimeMs; continue; }
+      const cmp = compareDshVersion(ver, bestVer);
+      if (cmp > 0 || (cmp === 0 && stat.mtimeMs > bestTime)) {
+        best = candidate; bestVer = ver; bestTime = stat.mtimeMs;
+      }
     } catch { /* skip */ }
   }
   return best;
@@ -183,13 +232,11 @@ function resolveBinJs() {
 // 0.2.x 提供 --no-open 关掉这次 handoff；0.1.x 根本不打开浏览器，也不认识这个开关
 // （commander 遇到未知参数会直接退出），所以只能按版本决定是否加。
 function supportsNoOpen(binJs) {
-  try {
-    const pkgPath = path.join(path.dirname(binJs), '..', 'package.json');
-    const version = String(JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version ?? '');
-    const m = /^(\d+)\.(\d+)/.exec(version);
-    if (!m) return false;
-    return Number(m[1]) > 0 || Number(m[2]) >= 2;
-  } catch { return false; }
+  // Major/minor only: 0.2.0-rc.1 already accepts --no-open, so comparing against
+  // the release "0.2.0" would wrongly reject early 0.2 prereleases.
+  const m = /^(\d+)\.(\d+)/.exec(String(readDshVersion(binJs) ?? ''));
+  if (!m) return false;
+  return Number(m[1]) > 0 || Number(m[2]) >= 2;
 }
 
 // ---------- 日志文件 ----------
@@ -229,8 +276,19 @@ function preserveLogs(tag) {
 
 async function main() {
   fs.mkdirSync(RUN, { recursive: true });
-  timing('start');
 
+  // 诊断入口：只回答「按当前规则会选哪一份 dsh」，不碰服务、不写 PID/日志。
+  if (PRINT_ENTRY) {
+    const entry = resolveBinJs();
+    process.stdout.write(JSON.stringify({
+      entry,
+      version: entry ? readDshVersion(entry) : null,
+      noOpen: entry ? supportsNoOpen(entry) : false
+    }) + '\n');
+    process.exit(entry ? 0 : 1);
+  }
+
+  timing('start');
   const cfg = readConfig();
   const targetPort = cfg.port;
 

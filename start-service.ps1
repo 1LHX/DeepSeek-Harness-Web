@@ -77,6 +77,55 @@ function Test-Port([int]$p) {
     return $false
 }
 
+# ---- dsh version helpers (same rules as dsh-panel.cs / update-dsh.ps1) ----
+# Numeric segments first; for the same x.y.z a release outranks a prerelease, and
+# prereleases compare by their trailing number: 0.1.0-rc.7 < 0.2.1-rc.5 < 0.2.1.
+function ConvertTo-DshVersionKey([string]$v) {
+    if (-not $v) { return $null }
+    $main = $v
+    $pre = ''
+    $dash = $v.IndexOf([char]45)
+    if ($dash -ge 0) { $main = $v.Substring(0, $dash); $pre = $v.Substring($dash + 1) }
+    $parts = $main.Split([char]46)
+    $nums = @(0, 0, 0)
+    for ($i = 0; $i -lt 3 -and $i -lt $parts.Count; $i++) {
+        $tmp = 0
+        if ([int]::TryParse($parts[$i], [ref]$tmp)) { $nums[$i] = $tmp }
+    }
+    $preNum = 0
+    if ($pre) {
+        $m = [regex]::Match($pre, '([0-9]+)$')
+        if ($m.Success) { $tmp2 = 0; if ([int]::TryParse($m.Groups[1].Value, [ref]$tmp2)) { $preNum = $tmp2 } }
+    }
+    return [pscustomobject]@{ Major = $nums[0]; Minor = $nums[1]; Patch = $nums[2]; Pre = $(if ($pre) { 1 } else { 0 }); PreNum = $preNum }
+}
+
+function Compare-DshVersion([string]$a, [string]$b) {
+    if (-not $a -and -not $b) { return 0 }
+    if (-not $a) { return -1 }
+    if (-not $b) { return 1 }
+    $ka = ConvertTo-DshVersionKey $a
+    $kb = ConvertTo-DshVersionKey $b
+    if ($ka.Major -ne $kb.Major) { if ($ka.Major -gt $kb.Major) { return 1 } else { return -1 } }
+    if ($ka.Minor -ne $kb.Minor) { if ($ka.Minor -gt $kb.Minor) { return 1 } else { return -1 } }
+    if ($ka.Patch -ne $kb.Patch) { if ($ka.Patch -gt $kb.Patch) { return 1 } else { return -1 } }
+    if ($ka.Pre -ne $kb.Pre) { if ($ka.Pre -lt $kb.Pre) { return 1 } else { return -1 } }
+    if ($ka.PreNum -ne $kb.PreNum) { if ($ka.PreNum -gt $kb.PreNum) { return 1 } else { return -1 } }
+    return 0
+}
+
+function Read-DshVersion([string]$binJs) {
+    try {
+        if (-not $binJs) { return $null }
+        $pkg = Join-Path (Split-Path -Parent (Split-Path -Parent $binJs)) 'package.json'
+        if (-not (Test-Path -LiteralPath $pkg)) { return $null }
+        $text = [System.IO.File]::ReadAllText($pkg, [System.Text.Encoding]::UTF8)
+        $m = [regex]::Match($text, '"version"\s*:\s*"([^"]+)"')
+        if ($m.Success) { return $m.Groups[1].Value }
+    } catch { }
+    return $null
+}
+
 # ---- locate an installed dsh entry point (pure file system; starts no process) ----
 function Resolve-DshBinJs([string]$nodePath) {
     $paths = New-Object System.Collections.ArrayList
@@ -90,12 +139,20 @@ function Resolve-DshBinJs([string]$nodePath) {
     if ($nodePath) {
         [void]$paths.Add((Join-Path (Split-Path -Parent $nodePath) 'node_modules\@deepseek-ai\dsh\lib\bin.js'))
     }
+    # Version-first (mtime only breaks ties). This must match dsh-panel.cs,
+    # dsh-launch.mjs and update-dsh.ps1, otherwise a touched older cache wins.
     $best = $null
+    $bestVer = $null
     $bestTime = [datetime]::MinValue
     foreach ($p in $paths) {
         if ($p -and (Test-Path -LiteralPath $p)) {
+            $ver = Read-DshVersion $p
             $t = (Get-Item -LiteralPath $p).LastWriteTimeUtc
-            if ((-not $best) -or ($t -gt $bestTime)) { $best = $p; $bestTime = $t }
+            if (-not $best) { $best = $p; $bestVer = $ver; $bestTime = $t; continue }
+            $cmp = Compare-DshVersion $ver $bestVer
+            if (($cmp -gt 0) -or (($cmp -eq 0) -and ($t -gt $bestTime))) {
+                $best = $p; $bestVer = $ver; $bestTime = $t
+            }
         }
     }
     return $best
@@ -108,12 +165,10 @@ function Resolve-DshBinJs([string]$nodePath) {
 function Test-DshNoOpen([string]$binJs) {
     try {
         if (-not $binJs) { return $false }
-        $pkgPath = Join-Path (Split-Path -Parent (Split-Path -Parent $binJs)) 'package.json'
-        if (-not (Test-Path -LiteralPath $pkgPath)) { return $false }
-        $pkg = Get-Content -LiteralPath $pkgPath -Raw | ConvertFrom-Json
-        $m = [regex]::Match([string]$pkg.version, '^(\d+)\.(\d+)')
-        if (-not $m.Success) { return $false }
-        return ([int]$m.Groups[1].Value -gt 0) -or ([int]$m.Groups[2].Value -ge 2)
+        $k = ConvertTo-DshVersionKey (Read-DshVersion $binJs)
+        if (-not $k) { return $false }
+        # Major/minor only: 0.2.0-rc.1 already accepts --no-open.
+        return (($k.Major -gt 0) -or ($k.Minor -ge 2))
     } catch { return $false }
 }
 

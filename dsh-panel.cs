@@ -2,8 +2,11 @@
 // 编译：build-dsh-panel.cmd（使用 Windows 自带 csc.exe，无需安装任何东西）
 // 设计：单窗口常驻面板 + 系统托盘；服务后台隐藏启动，活动日志实时显示；
 //       端口轮询与日志读取全部在后台线程，UI 线程零负担，拖动/缩放为原生速度。
-// 安全：本程序自身不调用任何进程启动 API——
-//       服务启动委托给同目录 start-service.ps1（参数全部为常量）；
+// 分层：本文件只负责窗口/托盘/顶栏/服务生命周期/WebView 导航；文件、终端、git、
+//       变更与会话边车全部在 dsh-workbench.cs；注入界面与边车脚本在 workbench/。
+// 安全：面板主程序自身不启动服务进程——服务启动委托给同目录 start-service.ps1 /
+//       dsh-launch.mjs（参数全部为常量）；工作台的 dsh-workbench.cs 是唯一允许起
+//       用户进程的地方（工作区路径锁 + 命令策略都在 C# 侧，见 README「安全边界」）。
 //       端口查询用 P/Invoke（GetExtendedTcpTable），进程结束用 Job Object / Process.Kill，
 //       打开浏览器用 ShellExecuteW。
 // v1.1：Job Object 整树终止；单实例互斥；托盘常驻；崩溃自动恢复（默认关）；
@@ -84,10 +87,19 @@
 //       升级走 update-dsh.ps1（npx 预热 @<版本>、先备份 ~/.dsh/sessions、结果写 run/update-*.txt，
 //       脚本不重启服务，由面板在成功后询问重启）；插件另走 update-plugins.ps1（dsh plugin update）。
 //       入口定位改为「按版本最高」（原来按 mtime），否则升级后新副本可能不是被选中的那份。
+// v3.9（0.2.x 鉴权）：dsh 0.2.x 的 Web UI 要 launch token；ResolveNavUrl 从 logs/dsh-web.log
+//       取最近匹配端口的地址导航，被 401 挡下时在 NavigationCompleted 重读令牌重试（每代 ≤2 次）；
+//       顶栏 URL chip 与日志只写裸地址。升级过程弹 UpdateProgressWindow（实时尾部 + 已用秒数）。
+// v3.9.1（更新插件）：update-plugins.ps1 无插件时 note=no-plugins，失败带 detail；面板复用
+//       同一个进度窗口，成功后询问是否重启服务。
 // v3.9.2（只开软件内页面）：dsh 0.2.x 起 `dsh web` 默认会自己打开系统浏览器，于是每次启动
 //       同时出现「软件内 + 浏览器内」两个页面。启动参数现在按版本带上 `--no-open`
 //       （0.1.x 不认识该开关，保持原样）；需要浏览器时点顶栏「浏览器」按钮，或用托盘/
 //       设置页的同名入口——打开的是带 launch token 的地址，不会先撞上鉴权页。
+// v3.9.3（结构一致性）：入口定位统一为「按版本最高」——start-service.ps1 / dsh-launch.mjs /
+//       check-boot-perf.ps1 与面板、update-dsh.ps1 用同一套规则（mtime 只做同版本平局），
+//       不再让被 touch 过的旧缓存抢到启动权；README 版本表按版本倒序整理、冒烟项数改为
+//       代码里实际的 21 项，dsh-web.config 的 compilecache 恢复默认关闭。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -112,8 +124,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.9.2.0")]
-[assembly: AssemblyFileVersion("3.9.2.0")]
+[assembly: AssemblyVersion("3.9.3.0")]
+[assembly: AssemblyFileVersion("3.9.3.0")]
 
 namespace DshPanel
 {
@@ -1157,7 +1169,7 @@ namespace DshPanel
 
         // 定位已安装的 dsh 入口（纯文件系统，不启动任何进程）。
         // 顺序与 start-service.ps1 的 Resolve-DshBinJs 保持一致：
-        // npx 缓存（取最新）-> 全局 npm -> node.exe 旁。
+        // npx 缓存（取版本最高）-> 全局 npm -> node.exe 旁。
         // 用途：面板在 check-dsh 结论之前就能判断「能不能启动服务」，让启动与检测并行。
         internal static string FindDshBinJs()
         {
