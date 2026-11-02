@@ -146,8 +146,17 @@ if ($BootTest -and $binJs) {
         $out = Join-Path $env:TEMP 'bootperf.out.log'
         $err = Join-Path $env:TEMP 'bootperf.err.log'
         Remove-Item $out, $err -ErrorAction SilentlyContinue
+        # dsh 0.2.x opens the default browser on boot; keep the boot test headless too.
+        # 0.1.x rejects the flag, so only pass it for 0.2.x+.
+        $noOpen = @()
+        try {
+            $pkgPath = Join-Path (Split-Path -Parent (Split-Path -Parent $binJs)) 'package.json'
+            $pkg = Get-Content -LiteralPath $pkgPath -Raw | ConvertFrom-Json
+            $m = [regex]::Match([string]$pkg.version, '^(\d+)\.(\d+)')
+            if ($m.Success -and (([int]$m.Groups[1].Value -gt 0) -or ([int]$m.Groups[2].Value -ge 2))) { $noOpen = @('--no-open') }
+        } catch { }
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        $p = Start-Process -FilePath $node -ArgumentList @("`"$binJs`"", 'web', '--port', $TestPort) `
+        $p = Start-Process -FilePath $node -ArgumentList (@("`"$binJs`"", 'web', '--port', $TestPort) + $noOpen) `
             -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
         $ready = $null
         $deadline = [DateTime]::UtcNow.AddSeconds(240)

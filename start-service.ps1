@@ -101,6 +101,22 @@ function Resolve-DshBinJs([string]$nodePath) {
     return $best
 }
 
+# ---- does this dsh understand `--no-open`? (0.2.x only) ----
+# dsh 0.2.x hands the Web UI to the default browser on boot unless --no-open is passed;
+# 0.1.x never opens a browser and rejects the flag (a boot-time unknown option), so the
+# flag is gated on the installed package version instead of being passed unconditionally.
+function Test-DshNoOpen([string]$binJs) {
+    try {
+        if (-not $binJs) { return $false }
+        $pkgPath = Join-Path (Split-Path -Parent (Split-Path -Parent $binJs)) 'package.json'
+        if (-not (Test-Path -LiteralPath $pkgPath)) { return $false }
+        $pkg = Get-Content -LiteralPath $pkgPath -Raw | ConvertFrom-Json
+        $m = [regex]::Match([string]$pkg.version, '^(\d+)\.(\d+)')
+        if (-not $m.Success) { return $false }
+        return ([int]$m.Groups[1].Value -gt 0) -or ([int]$m.Groups[2].Value -ge 2)
+    } catch { return $false }
+}
+
 # ---- keep the output of a failed attempt instead of letting the next one truncate it ----
 function Preserve-AttemptLogs([string]$tag) {
     foreach ($f in @($outLog, $errLog)) {
@@ -280,6 +296,11 @@ try {
     # port. Without it dsh would bind the profile default (3080) and a changed `port=`
     # would leave the panel probing a port nothing listens on.
     $webArgs = @('web', '--port', [string]$port)
+    # v3.9.2: the panel embeds the page itself; stop dsh 0.2.x from also opening the
+    # system browser. With no installed entry the npx attempt fetches the current
+    # (0.2.x+) package, which is exactly the case where the flag is needed.
+    $noOpenSupported = $(if ($binJs) { Test-DshNoOpen $binJs } else { $true })
+    if ($noOpenSupported) { $webArgs += '--no-open' }
     $entryArgs = @()
     if ($binJs) { $entryArgs = @(('"' + $binJs + '"')) + $webArgs }
     else { $entryArgs = @(('"' + $npxCli + '"'), '--yes', '--prefer-offline', '@deepseek-ai/dsh') + $webArgs }

@@ -176,6 +176,22 @@ function resolveBinJs() {
   return best;
 }
 
+// ---------- 是否支持 --no-open ----------
+//
+// dsh 0.2.x 起，`dsh web` 默认会在端口就绪时自己打开系统浏览器——面板已经把页面
+// 内嵌在 WebView2 里，于是每次启动都会同时出现「软件内 + 浏览器内」两个页面。
+// 0.2.x 提供 --no-open 关掉这次 handoff；0.1.x 根本不打开浏览器，也不认识这个开关
+// （commander 遇到未知参数会直接退出），所以只能按版本决定是否加。
+function supportsNoOpen(binJs) {
+  try {
+    const pkgPath = path.join(path.dirname(binJs), '..', 'package.json');
+    const version = String(JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version ?? '');
+    const m = /^(\d+)\.(\d+)/.exec(version);
+    if (!m) return false;
+    return Number(m[1]) > 0 || Number(m[2]) >= 2;
+  } catch { return false; }
+}
+
 // ---------- 日志文件 ----------
 
 function logPaths() {
@@ -278,7 +294,10 @@ async function main() {
     return;
   }
 
-  const args = [binJs, 'web', '--port', String(targetPort)];
+  const webArgs = ['web', '--port', String(targetPort)];
+  // v3.9.2：由面板/托盘/顶栏显式按需打开浏览器，DSH 自己不再抢着打开。
+  if (supportsNoOpen(binJs)) webArgs.push('--no-open');
+  const args = [binJs].concat(webArgs);
   if (hookUri) args.unshift('--import', hookUri);
 
   let child;

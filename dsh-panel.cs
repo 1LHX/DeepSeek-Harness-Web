@@ -84,6 +84,10 @@
 //       升级走 update-dsh.ps1（npx 预热 @<版本>、先备份 ~/.dsh/sessions、结果写 run/update-*.txt，
 //       脚本不重启服务，由面板在成功后询问重启）；插件另走 update-plugins.ps1（dsh plugin update）。
 //       入口定位改为「按版本最高」（原来按 mtime），否则升级后新副本可能不是被选中的那份。
+// v3.9.2（只开软件内页面）：dsh 0.2.x 起 `dsh web` 默认会自己打开系统浏览器，于是每次启动
+//       同时出现「软件内 + 浏览器内」两个页面。启动参数现在按版本带上 `--no-open`
+//       （0.1.x 不认识该开关，保持原样）；需要浏览器时点顶栏「浏览器」按钮，或用托盘/
+//       设置页的同名入口——打开的是带 launch token 的地址，不会先撞上鉴权页。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -98,6 +102,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
@@ -107,8 +112,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.8.0.0")]
-[assembly: AssemblyFileVersion("3.8.0.0")]
+[assembly: AssemblyVersion("3.9.2.0")]
+[assembly: AssemblyFileVersion("3.9.2.0")]
 
 namespace DshPanel
 {
@@ -360,6 +365,12 @@ namespace DshPanel
         internal static int Port = 3080;
         internal static string Url = "http://127.0.0.1:3080";
 
+        // v3.9：dsh 0.2.x 起 Web UI 有了浏览器会话鉴权——裸地址只会回一段
+        // "dsh web authentication required; reopen the URL printed by dsh web."。
+        // 服务启动时会把带 launch token 的地址写进 logs/dsh-web.log（"dsh web: http://…?token=…"），
+        // 面板从这里取真实导航地址；顶栏仍显示不带 token 的裸地址（避免 token 进截图/日志）。
+        internal static string NavUrl = "";
+
         internal static string ScriptRoot;
         internal static string PidFile;
         internal static string PortFile;               // v3.3：实际监听端口的记录（端口冲突顺延后以它为准）
@@ -404,6 +415,37 @@ namespace DshPanel
             {
                 try { Instance.AppendEvent(kind, text); } catch { }
             }
+        }
+
+        // v3.9：从服务启动日志里取最近一条「带 token 且端口与当前一致」的地址。
+        // 0.1.x 没有 token（日志里只有裸地址），此时回落到 Url，行为和旧版一致。
+        internal static string ResolveNavUrl()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(OutLog) || !File.Exists(OutLog)) return Url;
+                string last = null;
+                using (FileStream fs = new FileStream(OutLog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                {
+                    string line;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        int at = line.IndexOf("dsh web: ", StringComparison.Ordinal);
+                        if (at < 0) continue;
+                        string cand = line.Substring(at + 9).Trim();
+                        if (cand.IndexOf("token=", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        Uri u;
+                        if (!Uri.TryCreate(cand, UriKind.Absolute, out u)) continue;
+                        if (u.Port != Port) continue;
+                        last = cand;
+                    }
+                }
+                if (string.IsNullOrEmpty(last)) return Url;
+                NavUrl = last;
+                return last;
+            }
+            catch { return Url; }
         }
 
         [STAThread]
@@ -886,6 +928,7 @@ namespace DshPanel
         internal static string updateError = "";
         internal static string updateApplied = "";     // 最近一次升级的结果：yes / no
         internal static bool updateBusy;               // 正在检查或升级（防重入）
+        internal static volatile bool pluginUpdateBusy; // v3.9.1：正在更新插件（按钮文字用）
 
         // 版本比较：数字段优先；同号时预发布版（rc/beta）比正式版小，预发布之间按尾部数字比。
         // 返回 >0 表示 a 比 b 新。例：0.1.0-rc.7 < 0.2.1-rc.5；0.2.1-rc.5 < 0.2.1。
@@ -1024,17 +1067,22 @@ namespace DshPanel
         }
 
         // 更新插件（另一条升级线）：update-plugins.ps1 -> dsh plugin --profile web update
-        internal static void RunPluginUpdateAsync(Action<bool, string> done)
+        // v3.9.1：结果文件现在多两个字段——note（no-plugins 等结论）与 detail（pnpm/dsh 的
+        // 首条诊断，如 ERR_PNPM_FETCH_404、allow-version 提示），都翻成人话再给用户。
+        internal static void RunPluginUpdateAsync(Action<bool, string, string> done)
         {
             ThreadPool.QueueUserWorkItem(delegate
             {
                 bool ok = false;
                 string summary = null;
+                string note = null;
+                string detail = null;
+                bool ran = false;
                 try
                 {
                     string resultFile = Path.Combine(ScriptRoot, "run", "update-plugins.txt");
                     string ignored;
-                    RunScriptWaitResult("update-plugins.ps1", resultFile, 900000, out ignored);
+                    ran = RunScriptWaitResult("update-plugins.ps1", resultFile, 900000, out ignored);
                     if (File.Exists(resultFile))
                     {
                         foreach (string line in File.ReadAllLines(resultFile))
@@ -1045,15 +1093,27 @@ namespace DshPanel
                             string v = line.Substring(eq + 1).Trim();
                             if (k == "ok") ok = v == "yes";
                             else if (k == "error") summary = v;
+                            else if (k == "note") note = v;
+                            else if (k == "detail") detail = v;
                         }
                     }
-                    if (ok) summary = "插件已更新（重启服务后生效）";
-                    else if (string.IsNullOrEmpty(summary)) summary = "插件更新未完成（见 run/update-plugins.log）";
+                    if (!ran && File.Exists(resultFile) == false) summary = "插件更新没有返回结果（脚本未启动？见 run/update-plugins.log）";
+                    if (ok)
+                    {
+                        summary = note == "no-plugins"
+                            ? "当前 web profile 没有树外插件（package.json 的 dependencies 为空），无需更新。\r\nDSH 本体请用「更新到最新版」。"
+                            : "插件已更新（重启服务后生效）";
+                    }
+                    else
+                    {
+                        if (string.IsNullOrEmpty(summary)) summary = "插件更新未完成（见 run/update-plugins.log）";
+                        if (!string.IsNullOrEmpty(detail)) summary += "\r\n诊断：" + detail;
+                    }
                 }
                 catch (Exception ex) { summary = "插件更新失败：" + ex.Message; }
                 if (done != null)
                 {
-                    try { done(ok, summary); } catch { }
+                    try { done(ok, summary, note); } catch { }
                 }
             });
         }
@@ -1617,7 +1677,16 @@ namespace DshPanel
 
         internal static void OpenBrowser()
         {
-            try { ShellExecuteW(IntPtr.Zero, "open", Url, null, null, 1); } catch { }
+            try
+            {
+                // v3.9.2：0.2.x 的 Web UI 需要 launch token，裸地址会被 401 拦下。
+                // 直接沿用内嵌页面导航时解析出的那条带 token 地址，外部浏览器首次打开
+                // 也能立刻换到会话 Cookie；日志与顶栏 URL chip 仍只显示裸地址。
+                string target = ResolveNavUrl();
+                if (string.IsNullOrEmpty(target)) target = Url;
+                ShellExecuteW(IntPtr.Zero, "open", target, null, null, 1);
+            }
+            catch { }
         }
 
         // 打开外部链接（仅 http/https 公网地址；拒绝 localhost/环回/私有/保留地址）
@@ -1904,6 +1973,7 @@ namespace DshPanel
         bool webViewBusy;            // 初始化进行中（防重入）
         bool webShowsApp;            // 当前显示真实页面（非占位页）
         string webPlaceholderKind;   // 占位页状态："starting" / "down"
+        int authRetries;             // v3.9：本代服务内为鉴权重试导航的次数（上限 2）
 
         // v3.0：网页化 UI——顶栏状态胶囊 + 独立日志窗口
         StatusCapsule statusCapsule; // 服务状态胶囊（点击启停）
@@ -1913,6 +1983,8 @@ namespace DshPanel
         // v3.1：设置与 DSH 检测引导
         SmallButton btnSettings;     // 打开设置页
         SmallButton btnWorkbench;    // v3.5：打开/收起工作台抽屉
+        SmallButton btnBrowser;      // v3.9.2：在系统浏览器中打开当前页面
+        ToolTip browserTip;          // 「浏览器」按钮 tooltip
         SettingsWindow settingsWindow; // 设置页（隐藏创建）
         Panel setupPanel;            // DSH 缺失时的提示引导页（覆盖网页区）
         RoundedButton btnSetupRecheck;
@@ -2386,15 +2458,16 @@ namespace DshPanel
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));   // 1: 网页（铺满）
             rootLayout = layout;
 
-            // ---- 顶栏：Header（左）+ 状态胶囊 + 设置（右） ----
+            // ---- 顶栏：Header（左）+ 状态胶囊 + 浏览器 + 工作台 + 设置（右） ----
             TableLayoutPanel topRow = new TableLayoutPanel();
             topRow.Dock = DockStyle.Fill;
-            topRow.ColumnCount = 4;
+            topRow.ColumnCount = 5;
             topRow.RowCount = 1;
             topRow.BackColor = Theme.Card;
             topRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 118)); // 状态胶囊
+            topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));  // v3.9.2：浏览器
             topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));  // v3.5：工作台
             topRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 72));  // 设置按钮
 
@@ -2425,6 +2498,25 @@ namespace DshPanel
                 }
             };
 
+            // v3.9.2：软件内页面旁边的「浏览器」入口——想看同一个页面时按需打开系统浏览器。
+            // 默认用带 launch token 的地址，0.2.x 的鉴权页不会出现；服务未运行时置灰。
+            btnBrowser = new SmallButton("浏览器");
+            btnBrowser.Dock = DockStyle.Fill;
+            btnBrowser.Margin = new Padding(2, 9, 2, 9);
+            btnBrowser.Enabled = false;
+            browserTip = new ToolTip();
+            browserTip.SetToolTip(btnBrowser, "在系统浏览器中打开当前 DSH 页面");
+            btnBrowser.Click += delegate
+            {
+                if (!Program.IsPortOpen())
+                {
+                    Program.LogEvent(LogKind.Warn, "服务未运行，暂时没有可打开的页面");
+                    return;
+                }
+                Program.LogEvent(LogKind.Info, "在系统浏览器中打开当前页面");
+                Program.OpenBrowser();
+            };
+
             // v3.5：工作台入口（文件 / 终端 / 任务 / 变更 / Git）
             btnWorkbench = new SmallButton("工作台");
             btnWorkbench.Dock = DockStyle.Fill;
@@ -2443,8 +2535,9 @@ namespace DshPanel
 
             topRow.Controls.Add(header, 0, 0);
             topRow.Controls.Add(statusCapsule, 1, 0);
-            topRow.Controls.Add(btnWorkbench, 2, 0);
-            topRow.Controls.Add(btnSettings, 3, 0);
+            topRow.Controls.Add(btnBrowser, 2, 0);
+            topRow.Controls.Add(btnWorkbench, 3, 0);
+            topRow.Controls.Add(btnSettings, 4, 0);
 
             layout.Controls.Add(topRow, 0, 0);
 
@@ -2711,6 +2804,9 @@ namespace DshPanel
                 if (env == null) env = await CoreWebView2Environment.CreateAsync(null, null, envOpts);
                 await webView.EnsureCoreWebView2Async(env);
                 webViewInited = true;
+                // v3.9：裸地址被 401 挡下时（token 还没写进日志 / 服务刚换代），
+                // 导航完成后重读启动令牌再走一次，见 RetryAuthenticatedNavigation。
+                try { webView.CoreWebView2.NavigationCompleted += delegate { OnAppNavigationCompleted(); }; } catch { }
                 Program.BootMark("webview2-ready");
                 Program.LogEvent(LogKind.Info, "内嵌浏览器已就绪（WebView2）");
                 // v3.5：工作台（注入式抽屉 + 桥接 + 会话边车）
@@ -2764,6 +2860,41 @@ namespace DshPanel
             try { webView.CoreWebView2.NavigateToString(html); } catch { }
         }
 
+        // v3.9：页面被鉴权门挡下时（裸地址、或 token 还没落进日志）重读启动令牌再导航一次。
+        // 检测方式是读一段 innerText——0.2.x 的拒绝页正文就是那行提示，没有别的标记。
+        void OnAppNavigationCompleted()
+        {
+            if (webViewFailed || !webShowsApp || authRetries >= 2) return;
+            try
+            {
+                CoreWebView2 core = webView.CoreWebView2;
+                if (core == null) return;
+                core.ExecuteScriptAsync("(document.body&&document.body.innerText||'').slice(0,200)")
+                    .ContinueWith(delegate(Task<string> t)
+                    {
+                        string text = "";
+                        try { text = t.Result ?? ""; } catch { }
+                        if (text.IndexOf("authentication required", StringComparison.OrdinalIgnoreCase) < 0) return;
+                        TryBeginInvoke(delegate { RetryAuthenticatedNavigation(); });
+                    });
+            }
+            catch { }
+        }
+
+        void RetryAuthenticatedNavigation()
+        {
+            if (webViewFailed || !webShowsApp) return;
+            if (authRetries >= 2)
+            {
+                Program.LogEvent(LogKind.Warn, "仍然拿不到有效令牌，请用顶栏「浏览器」按钮打开，或重启服务");
+                return;
+            }
+            authRetries++;
+            string target = Program.ResolveNavUrl();
+            Program.LogEvent(LogKind.Warn, "页面要求重新认证，改用启动令牌地址重试（第 " + authRetries + " 次）");
+            try { webView.CoreWebView2.Navigate(target); } catch { }
+        }
+
         // 服务状态 <-> 网页内容同步（UI 线程；PollTick 每 2s 驱动）
         void SyncWebView(bool running)
         {
@@ -2776,8 +2907,10 @@ namespace DshPanel
                     {
                         webShowsApp = true;
                         webPlaceholderKind = null;
+                        authRetries = 0;
                         Program.BootMark("navigate: " + Program.Url);
-                        webView.CoreWebView2.Navigate(Program.Url);
+                        // v3.9：走带 token 的地址，否则 0.2.x 只会显示一行鉴权提示
+                        webView.CoreWebView2.Navigate(Program.ResolveNavUrl());
                     }
                 }
                 else
@@ -2786,6 +2919,7 @@ namespace DshPanel
                     if (webShowsApp || webPlaceholderKind != kind)
                     {
                         webShowsApp = false;
+                        authRetries = 0;          // 换了一代服务，launch token 也换了
                         ShowPlaceholder(kind);
                     }
                 }
@@ -2989,6 +3123,8 @@ namespace DshPanel
                         string st = statusText; Color sc = statusColor;
                         bool run = running; bool pu = pulse;
                         statusCapsule.SetStatus(st, sc);
+                        // v3.9.2：「浏览器」按钮只在服务运行时可用（置灰 = 没有可打开的页面）
+                        try { if (btnBrowser != null) btnBrowser.Enabled = run; } catch { }
                         // 胶囊 tooltip：端口 + 运行时长/日志大小
                         try { capsuleTip.SetToolTip(statusCapsule, "端口 " + Program.Port + "\n" + infoText); } catch { }
                         // 托盘状态图标：绿=运行 / 灰=未运行 / 琥珀=启动停止中
@@ -3377,7 +3513,11 @@ namespace DshPanel
                     btnUpdateApply.Enabled = !busy && Program.updateAvailable;
                     if (!busy) btnUpdateApply.Text = "更新到最新版";
                 }
-                if (btnUpdatePlugins != null) btnUpdatePlugins.Enabled = !busy;
+                if (btnUpdatePlugins != null)
+                {
+                    btnUpdatePlugins.Enabled = !busy;
+                    btnUpdatePlugins.Text = Program.pluginUpdateBusy ? "更新中…" : "更新插件";
+                }
 
                 string current = string.IsNullOrEmpty(Program.updateCurrent) ? "未知" : Program.updateCurrent;
                 string latest = string.IsNullOrEmpty(Program.updateLatest) ? "未知" : Program.updateLatest;
@@ -3527,18 +3667,24 @@ namespace DshPanel
             for (int i = 0; i < 3; i++) row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
             btnUpdateCheck = new SmallButton("检查更新");
-            btnUpdateCheck.Size = new Size(88, 26);
+            btnUpdateCheck.AutoWidth = true;
+            btnUpdateCheck.Height = 26;
             btnUpdateCheck.Margin = new Padding(0, 4, 8, 4);
+            btnUpdateCheck.FitWidth();
             btnUpdateCheck.Click += delegate { StartUpdateCheck(); };
 
             btnUpdateApply = new SmallButton("更新到最新版");
-            btnUpdateApply.Size = new Size(112, 26);
+            btnUpdateApply.AutoWidth = true;
+            btnUpdateApply.Height = 26;
             btnUpdateApply.Margin = new Padding(0, 4, 8, 4);
+            btnUpdateApply.FitWidth();
             btnUpdateApply.Click += delegate { StartUpdateApply(); };
 
             btnUpdatePlugins = new SmallButton("更新插件");
-            btnUpdatePlugins.Size = new Size(84, 26);
+            btnUpdatePlugins.AutoWidth = true;
+            btnUpdatePlugins.Height = 26;
             btnUpdatePlugins.Margin = new Padding(0, 4, 0, 4);
+            btnUpdatePlugins.FitWidth();
             btnUpdatePlugins.Click += delegate { StartPluginUpdate(); };
 
             row.Controls.Add(btnUpdateCheck, 0, 0);
@@ -3560,6 +3706,13 @@ namespace DshPanel
                     if (owner != null) { try { owner.ApplyUpdateBadge(); } catch { } }
                 });
             }, true);
+            // v3.9：检查最长 90 秒。先把按钮和状态行切成「检查中」，否则点下去像没反应。
+            RefreshUpdateStatus();
+            if (Program.updateBusy && lblUpdateStatus != null)
+            {
+                lblUpdateStatus.ForeColor = Theme.TextMuted;
+                lblUpdateStatus.Text = "正在检查更新…（要访问 npm 与 GitHub，首次可能几十秒）";
+            }
         }
 
         void StartUpdateApply()
@@ -3580,12 +3733,17 @@ namespace DshPanel
             if (btnUpdateApply != null) btnUpdateApply.Text = "更新中…";
             RefreshUpdateStatus();
             Program.LogEvent(LogKind.Info, "开始更新 DeepSeek Harness（" + cur + " → " + tgt + "），详细过程见 run/update-apply.log");
+            // v3.9：升级要 1~2 分钟且期间设置页无任何变化，弹一个带进度条与实时日志的窗口
+            UpdateProgressWindow progress = null;
+            try { progress = new UpdateProgressWindow("正在更新 DeepSeek Harness", cur + "  →  " + tgt, "update-apply.log"); progress.Show(this); }
+            catch (Exception pex) { progress = null; Program.LogEvent(LogKind.Warn, "进度窗口没弹出来：" + pex.Message); }
             Program.ApplyUpdateAsync(delegate(bool ok, string summary)
             {
                 Program.updateBusy = false;
                 Program.LogEvent(ok ? LogKind.Success : LogKind.Error, summary);
                 BeginInvokeSafe(delegate
                 {
+                    try { if (progress != null) { progress.Finish(); progress.Close(); progress = null; } } catch { }
                     RefreshUpdateStatus();
                     if (owner != null) { try { owner.ApplyUpdateBadge(); } catch { } }
                     if (ok)
@@ -3615,18 +3773,35 @@ namespace DshPanel
             if (r != DialogResult.OK) return;
 
             Program.updateBusy = true;
+            Program.pluginUpdateBusy = true;
             RefreshUpdateStatus();
+            if (lblUpdateStatus != null)
+            {
+                lblUpdateStatus.ForeColor = Theme.TextMuted;
+                lblUpdateStatus.Text = "正在更新插件…（过程见 run/update-plugins.log）";
+            }
             Program.LogEvent(LogKind.Info, "开始更新 DSH 插件（run/update-plugins.log）…");
-            Program.RunPluginUpdateAsync(delegate(bool ok, string summary)
+            // v3.9.1：与本体升级一致——弹进度窗口看实时日志
+            UpdateProgressWindow progress = null;
+            try { progress = new UpdateProgressWindow("正在更新 DSH 插件", "web profile · dsh plugin update", "update-plugins.log"); progress.Show(this); }
+            catch (Exception pex) { progress = null; Program.LogEvent(LogKind.Warn, "进度窗口没弹出来：" + pex.Message); }
+            Program.RunPluginUpdateAsync(delegate(bool ok, string summary, string note)
             {
                 Program.updateBusy = false;
-                Program.LogEvent(ok ? LogKind.Success : LogKind.Error, summary);
+                Program.pluginUpdateBusy = false;
                 BeginInvokeSafe(delegate
                 {
+                    try { if (progress != null) { progress.Finish(); progress.Close(); progress = null; } } catch { }
                     RefreshUpdateStatus();
-                    MessageBox.Show(this, summary + "\r\n\r\n日志：run\\update-plugins.log",
-                        ok ? "插件更新完成" : "插件更新未完成", MessageBoxButtons.OK,
+                    Program.LogEvent(ok ? LogKind.Success : LogKind.Error, summary);
+                    // 只有真的装了东西才问重启；「没有树外插件」是信息，不是变更
+                    bool changed = ok && note != "no-plugins";
+                    DialogResult r2 = MessageBox.Show(this, summary + "\r\n\r\n日志：run\\update-plugins.log" +
+                        (changed ? "\r\n\r\n需要重启服务才会加载新插件，现在重启吗？" : ""),
+                        ok ? "插件更新完成" : "插件更新未完成",
+                        changed ? MessageBoxButtons.YesNo : MessageBoxButtons.OK,
                         ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                    if (changed && r2 == DialogResult.Yes && owner != null) owner.RestartServiceForUpdate();
                 });
             });
         }
@@ -4222,6 +4397,176 @@ namespace DshPanel
 
     // ---------- 小号扁平按钮（日志工具栏） ----------
 
+    // ---------- v3.9：升级过程窗口（不确定进度条 + 实时日志尾巴） ----------
+    // 背景：升级由 update-dsh.ps1 跑 1~2 分钟，这期间设置页一个字都不会变，
+    // 用户没法判断是在下载还是已经卡死。这里把 run/update-apply.log 的尾部
+    // 实时贴出来，配一条 marquee 进度条与已用秒数；「在后台继续」只是隐藏，
+    // 升级不会中断，结束后面板照旧弹结果并询问是否重启服务。
+    class UpdateProgressWindow : Form
+    {
+        readonly string logPath;
+        readonly System.Windows.Forms.Timer timer;
+        Label lblPhase;
+        Label lblElapsed;
+        TextBox txtLog;
+        ProgressBar bar;
+        readonly DateTime startedAt = DateTime.Now;
+
+        public UpdateProgressWindow(string titleText, string subtitleText, string logFileName)
+        {
+            logPath = Path.Combine(Program.ScriptRoot, "run", logFileName);
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            ClientSize = new Size(560, 322);
+            BackColor = Color.White;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            KeyPreview = true;
+
+            Label title = new Label();
+            title.Text = string.IsNullOrEmpty(titleText) ? "正在更新" : titleText;
+            title.Font = new Font("Microsoft YaHei UI", 11.5F, FontStyle.Bold);
+            title.ForeColor = Theme.TextStrong;
+            title.AutoSize = true;
+            title.Location = new Point(22, 16);
+            Controls.Add(title);
+
+            Label sub = new Label();
+            sub.Text = string.IsNullOrEmpty(subtitleText) ? "" : subtitleText;
+            sub.ForeColor = Theme.TextMuted;
+            sub.AutoSize = true;
+            sub.Location = new Point(22, 46);
+            Controls.Add(sub);
+
+            bar = new ProgressBar();
+            bar.Style = ProgressBarStyle.Marquee;
+            bar.MarqueeAnimationSpeed = 30;
+            bar.Location = new Point(22, 74);
+            bar.Size = new Size(516, 8);
+            Controls.Add(bar);
+
+            lblPhase = new Label();
+            lblPhase.Text = "准备中…";
+            lblPhase.ForeColor = Theme.BlueInk;
+            lblPhase.AutoEllipsis = true;
+            lblPhase.Location = new Point(22, 90);
+            lblPhase.Size = new Size(516, 20);
+            Controls.Add(lblPhase);
+
+            txtLog = new TextBox();
+            txtLog.Multiline = true;
+            txtLog.ReadOnly = true;
+            txtLog.ScrollBars = ScrollBars.Vertical;
+            txtLog.WordWrap = false;
+            txtLog.BackColor = Theme.Surface;
+            txtLog.BorderStyle = BorderStyle.FixedSingle;
+            txtLog.Font = new Font("Consolas", 8.25F);
+            txtLog.Location = new Point(22, 116);
+            txtLog.Size = new Size(516, 136);
+            Controls.Add(txtLog);
+
+            lblElapsed = new Label();
+            lblElapsed.Text = "已用 0 秒";
+            lblElapsed.ForeColor = Theme.TextFaint;
+            lblElapsed.AutoSize = true;
+            lblElapsed.Location = new Point(22, 260);
+            Controls.Add(lblElapsed);
+
+            SmallButton hide = new SmallButton("在后台继续");
+            hide.AutoWidth = true;
+            hide.Height = 26;
+            hide.FitWidth();
+            hide.Location = new Point(436, 252);
+            hide.Click += delegate { Hide(); };
+            Controls.Add(hide);
+
+            Label hint = new Label();
+            hint.Text = "下载较慢时会持续一段时间；关掉这个窗口不会中断任务。";
+            hint.ForeColor = Theme.TextFaint;
+            hint.AutoSize = true;
+            hint.Location = new Point(22, 290);
+            Controls.Add(hint);
+
+            timer = new System.Windows.Forms.Timer();
+            timer.Interval = 500;
+            timer.Tick += delegate { Poll(); };
+            timer.Start();
+            Poll();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (Pen p = new Pen(Theme.BorderStrong))
+            {
+                e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+            }
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape) { Hide(); e.Handled = true; return; }
+            base.OnKeyDown(e);
+        }
+
+        // 升级结束（成功或失败）时由调用方关闭：先定格进度条，再 Close()
+        public void Finish()
+        {
+            try { timer.Stop(); } catch { }
+            Poll();
+            try
+            {
+                bar.Style = ProgressBarStyle.Continuous;
+                bar.Value = 100;
+            }
+            catch { }
+            if (lblPhase != null) lblPhase.Text = "已结束，正在显示结果…";
+        }
+
+        // 每 500ms 刷一次日志尾巴：textbox 显示最近 12 行，状态行取最后一条非空行
+        void Poll()
+        {
+            try
+            {
+                if (File.Exists(logPath))
+                {
+                    string[] lines = ReadTail(12);
+                    string text = string.Join(Environment.NewLine, lines);
+                    if (txtLog.Text != text)
+                    {
+                        txtLog.Text = text;
+                        txtLog.SelectionStart = txtLog.TextLength;
+                        txtLog.ScrollToCaret();
+                    }
+                    for (int i = lines.Length - 1; i >= 0; i--)
+                    {
+                        string l = lines[i].Trim();
+                        if (l.Length > 0) { lblPhase.Text = l; break; }
+                    }
+                }
+                else
+                {
+                    lblPhase.Text = "准备中…（脚本还没开始写日志）";
+                }
+            }
+            catch { }
+            try { lblElapsed.Text = "已用 " + (int)(DateTime.Now - startedAt).TotalSeconds + " 秒"; } catch { }
+        }
+
+        string[] ReadTail(int count)
+        {
+            List<string> all = new List<string>();
+            using (FileStream fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+            {
+                string line;
+                while ((line = sr.ReadLine()) != null) all.Add(line);
+            }
+            int start = Math.Max(0, all.Count - count);
+            return all.GetRange(start, all.Count - start).ToArray();
+        }
+    }
+
     class SmallButton : Control
     {
         bool hovering;
@@ -4240,6 +4585,25 @@ namespace DshPanel
         {
             get { return hasBadge; }
             set { if (hasBadge != value) { hasBadge = value; Invalidate(); } }
+        }
+
+        // v3.9：按文字实际宽度自适应。固定 Width 在 DPI 缩放/窄列里会把中文挤成两行，
+        // 再被 VerticalCenter 纵向居中叠在一起——「检查更新」上下分层就是这条。
+        public bool AutoWidth { get; set; }
+
+        public void FitWidth()
+        {
+            if (!AutoWidth) return;
+            Size ts = TextRenderer.MeasureText(Text, Font, new Size(int.MaxValue, int.MaxValue),
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            int w = Math.Max(ts.Width + 20, 56);
+            if (Width != w) Width = w;
+        }
+
+        protected override void OnTextChanged(EventArgs e)
+        {
+            base.OnTextChanged(e);
+            FitWidth();
         }
 
         public SmallButton(string text)
@@ -4292,7 +4656,9 @@ namespace DshPanel
                 Ui.FillRound(g, new Rectangle(0, 0, Width, Height), Theme.RadiusSmall, bg);
             }
             TextRenderer.DrawText(g, Text, Font, ClientRectangle, fg,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPadding |
+                TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
 
             if (hasBadge)
             {

@@ -42,7 +42,10 @@ const MAX_EVENTS_BACKFILL = 300;
 const MAX_TURNS = 20;
 const MAX_TOOLS_PER_CARD = 6;
 const BOARD_THROTTLE_MS = 700;
-const FILE_NAME = 'session.jsonl.zstd';
+// dsh 0.2.x writes session.v4.jsonl.zstd; older releases used session.jsonl.zstd.
+// Keep both so the board follows the current session after an upgrade instead of
+// silently binding to a stale legacy file (which is what made it flicker).
+const SESSION_FILE_RE = /^session(?:\.v\d+)?\.jsonl\.zstd$/;
 
 function parseArgs(argv) {
   const out = { cwd: process.cwd(), poll: 800, backfill: 4 * 1024 * 1024, sessions: null };
@@ -349,9 +352,23 @@ function candidateFiles() {
     let subs;
     try { subs = fs.readdirSync(base, { withFileTypes: true }); } catch { continue; }
     for (const sub of subs) {
-      const f = sub.isDirectory() ? path.join(base, sub.name, FILE_NAME) : (sub.name === FILE_NAME ? path.join(base, sub.name) : null);
-      if (!f) continue;
-      try { const st = fs.statSync(f); if (st.isFile()) files.push({ file: f, size: st.size, mtime: st.mtimeMs }); } catch { }
+      const candidates = [];
+      if (sub.isDirectory()) {
+        const sessionDir = path.join(base, sub.name);
+        let inner;
+        try { inner = fs.readdirSync(sessionDir, { withFileTypes: true }); } catch { continue; }
+        for (const file of inner) {
+          if (file.isFile() && SESSION_FILE_RE.test(file.name)) candidates.push(path.join(sessionDir, file.name));
+        }
+      } else if (SESSION_FILE_RE.test(sub.name)) {
+        candidates.push(path.join(base, sub.name));
+      }
+      for (const f of candidates) {
+        try {
+          const st = fs.statSync(f);
+          if (st.isFile()) files.push({ file: f, size: st.size, mtime: st.mtimeMs });
+        } catch { }
+      }
     }
   }
   files.sort((a, b) => b.mtime - a.mtime);
@@ -458,7 +475,18 @@ function pollOnce() {
   } catch (e) { note('read failed: ' + e.message); return; }
   const dec = decodeFrames(buf);
   if (dec.consumed > 0) current.offset += dec.consumed;
-  if (!dec.text) return;
+  if (!dec.text) {
+    // A frame that cannot be decoded (corrupt/truncated tail) used to make the
+    // polling loop read the whole file again every 800 ms. Skip it once: try the
+    // next frame boundary, otherwise treat the rest as unreadable and move on.
+    if (dec.consumed === 0) {
+      const next = buf.indexOf(ZSTD_MAGIC, 1);
+      const stuckAt = current.offset;
+      current.offset = next >= 0 ? current.offset + next : size;
+      note('skipped undecodable frame at offset ' + stuckAt + ' -> ' + current.offset);
+    }
+    return;
+  }
   const events = [];
   parseLines(dec.text, events, skipped);
   for (const ev of events) emit({ t: 'ev', ev, sessionId: current.id });

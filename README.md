@@ -11,6 +11,7 @@ v3.5 起顶栏多一个「工作台」（快捷键 F2）：文件、终端、任
 1. 双击 `dsh-panel.cmd`（首次会自动编译 `dsh-panel.exe`）
 2. 打开即自动检测 DeepSeek Harness：已安装则自动启动服务并全屏内嵌显示 DSH 网页；
    未安装则显示安装指引页（`npm install -g @deepseek-ai/dsh`），安装完成后点击「重新检测」进入
+   （v3.9.2 起**只开软件内页面**；要在系统浏览器里看同一页，点顶栏「浏览器」按钮）
 3. 关闭窗口即最小化到系统托盘（服务继续运行）；托盘菜单可启停 / 开浏览器 / 退出
 
 > 要求：Windows 10/11（需 WebView2 Runtime，随 Edge 自动更新；缺失时面板会提示，
@@ -347,8 +348,9 @@ stop-dsh.cmd --dry-run  # 预览将要终止的进程，不实际执行
 
 ## 面板功能要点
 
-- **网页化主界面**：打开即检测 DeepSeek Harness 并自动启动服务，窗口最大化，WebView2 内嵌 DSH 界面铺满窗口- **DSH 缺失指引**：检测不到 @deepseek-ai/dsh 时显示安装指引页（手动安装命令 + 重新检测），就绪后自动进入；检测结果区分「未安装 / 检测超时」，超时明确提示检查 Node.js
-- 顶栏薄工具条：品牌蓝 Logo + 标题 + URL 浅蓝 chip / 服务状态胶囊（浅底深字，点击启停，悬停显示端口与运行时长）/ 工作台（v3.5）/ 设置按钮——配色与圆角见「界面设计规范」
+- **网页化主界面**：打开即检测 DeepSeek Harness 并自动启动服务，窗口最大化，WebView2 内嵌 DSH 界面铺满窗口（v3.9.2 起**不再额外弹出系统浏览器**：启动参数按版本带 `--no-open`，0.1.x 不认该开关则保持原行为）
+- **DSH 缺失指引**：检测不到 @deepseek-ai/dsh 时显示安装指引页（手动安装命令 + 重新检测），就绪后自动进入；检测结果区分「未安装 / 检测超时」，超时明确提示检查 Node.js
+- 顶栏薄工具条：品牌蓝 Logo + 标题 + URL 浅蓝 chip / 服务状态胶囊（浅底深字，点击启停，悬停显示端口与运行时长）/ **浏览器（v3.9.2，按需在系统浏览器打开当前页，服务未运行时置灰）** / 工作台（v3.5）/ 设置按钮——配色与圆角见「界面设计规范」
 - **设置页**：常规（开机自启、崩溃自动恢复、启动时自动启动服务——胶囊拨动开关，偏好持久化到注册表）/ 服务（端口、DSH 状态与重新检测、打开日志窗口/日志目录/系统浏览器、清除浏览器缓存）/ 关于（版本、依赖说明、项目主页）
 - 活动日志为独立弹窗：时间戳彩色事件流（面板操作 + 服务输出），清空 / 复制 / 打开目录 / 自动滚动，显示运行时长与日志大小
 - 服务停止/启动中网页显示占位页，恢复后自动回到真实页面；WebView2 缺失时回退系统浏览器
@@ -457,7 +459,7 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 |---|---|---|
 | 检查更新 | 跳过节流立刻查，并多取 `dist-tags`（latest / next / alpha） | `check-update.ps1 -Force -WithTags` |
 | 更新到最新版 | 确认后升级本体（默认 latest 通道） | `update-dsh.ps1 -Apply` |
-| 更新插件 | 升 web profile 下的插件（另一条升级线） | `update-plugins.ps1` → `dsh plugin --profile web update` |
+| 更新插件 | 升 web profile 下的树外插件（另一条升级线）；无插件时只报告、不启动 pnpm | `update-plugins.ps1` → `dsh plugin --profile web update` |
 
 升级本体这条链做的事（都在 `update-dsh.ps1` 里，面板只负责点按钮和重启服务）：
 
@@ -467,6 +469,50 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 4. **升级**：`npx --yes @deepseek-ai/dsh@<目标版本> --version`；
 5. **验证**：重新扫版本 → 写入 `run/update-check.txt`（`applied=yes|no`）；过程全量记 `run/update-apply.log`；
 6. **重启**：面板弹窗问「现在重启吗」，选是就先停干净再起（新版本才会生效）。
+
+### v3.9：升级过程可见 + 0.2.x 会话鉴权
+
+两个体验问题都是 0.2.x 升级后才暴露的：
+
+1. **升级期间没有任何反馈**（脚本跑 1~2 分钟，设置页一个字都不变，看起来像卡死）。
+   现在确认升级后立刻弹 `UpdateProgressWindow`：marquee 进度条 + 已用秒数 + 实时滚动 `run/update-apply.log` 尾部 12 行，
+   状态行取最后一条非空日志；「在后台继续」只是隐藏窗口，升级不中断，结束后面板照旧弹结果并问是否重启服务。
+   「检查更新」点下去也会立刻把按钮切成「检查中…」并把状态行改成进行中（检查最长 90 秒）。
+2. **升完打不开 DSH**：0.2.x 起 Web UI 有浏览器会话鉴权，裸地址只返回
+   `dsh web authentication required; reopen the URL printed by dsh web.`。
+   `dsh web` 启动时会把带 launch token 的地址写进 `logs/dsh-web.log`（`dsh web: http://127.0.0.1:<端口>/?token=…`），
+   面板现在用 `Program.ResolveNavUrl()` 从里面取**最后一条端口匹配**的地址来导航；页面仍被挡下时由
+   `OnAppNavigationCompleted` 重读令牌再试（每代服务上限 2 次，服务换代清零）。
+   顶栏 URL chip 与 `BootMark` 只写裸地址，**token 不会进截图和日志**。
+   0.1.x 没有 token 行，此时自动回落裸地址，行为与旧版一致。
+
+顺带一条升级副作用（0.2.x 的 settings 迁移）：`~/.dsh/settings.yaml` 会被改名为 `settings.yaml.imported`，
+分节写进 `profiles/web/cordis.patch.yml`；本次迁移还把 `model: deepseek-v4-flash` 归一成了 `deepseek-flash`
+（即 V4.1-Flash-1017，支持图像理解）。以后改默认模型改 `cordis.patch.yml`，或直接用设置页的模型选择器。
+
+### v3.9.1：「更新插件」这条线收敛
+
+这条链原来是「点一下 → 置灰 → 弹一句 `dsh plugin update failed (exit 1)`」，实测定下来四个坑，逐个修掉：
+
+1. **缺 pnpm 时必然失败，且报错不可读**：dsh 那条 `pnpm was not found` 提示挂在 `exitCode === 127` 上，
+   Windows 的 cmd 找不到命令返回的是 **1**，所以永远不打印。现在脚本先 `Get-Command pnpm` 预检，
+   缺了就直接告诉你 `未找到 pnpm：运行 npm i -g pnpm（或 corepack enable pnpm）`。
+2. **空 dependencies 会「假成功」**：DSH 本体的组合包（dsh-base / dsh-web-app）由 launcher 自带，
+   不写进 profile 的 `dependencies`，所以 `pnpm update` 只会 `Already up to date` 并 exit 0，
+   面板会误报「插件已更新」。现在先读 profile 的 `package.json`：为空就写 `note=no-plugins` 直接返回，
+   既不启动 pnpm，也不会在 profile 里凭空造出 `node_modules/` 和 `pnpm-lock.yaml`。
+3. **入口按 mtime 选，和「版本最高」不变量相反**：`update-plugins.ps1` 原本挑 `bin.js` 的最新 mtime，
+   而启动器 / 面板 / `update-dsh.ps1` 都用版本号最高。旧缓存被 touch 一下，就可能用 **0.1.x 的 dsh**
+   去改一个已被 0.2.x 迁移过的 profile。现在统一成版本号最高（同一套 `ConvertTo-VersionKey` / `Test-VersionNewer`）。
+4. **面板侧没有反馈、成功不提示重启**：现在点下去立刻切「更新中…」并写状态行，弹同一个进度窗口
+   （日志换成 `run/update-plugins.log`），成功后像本体升级一样问「现在重启服务吗」。
+
+配套：脚本加了 600 秒硬超时（面板侧 900 秒），结果文件新增 `detail=`，把 pnpm / dsh 的首条诊断
+（`ERR_PNPM_FETCH_404`、`dsh: to accept the risk, run: … allow-version …`）带进弹窗。
+
+> PS 5.1 坑（这次踩到）：`Start-Process -PassThru` 拿回来的 `.ExitCode` 是**空值**，
+> 于是一次成功的更新被判成失败（`exit=` 空、`ok=no`）。改用 `System.Diagnostics.Process` +
+> `ReadToEndAsync()` 才拿到真实退出码，也顺带避免管道写满导致的死锁。
 
 ### 关于文章里那条「npx 重跑就是升级」
 
@@ -571,6 +617,12 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 9. **设置页状态一直是「检测中…」** → v3.7.1 已修（旧版检测完不刷新标签）。若仍出现，看活动日志里有没有 `正在重新检测 DeepSeek Harness…` 且 30 秒内有没有 `DeepSeek Harness 已就绪`：没有的话说明 `check-dsh.ps1` 没跑完，手动执行 `powershell -NoProfile -File check-dsh.ps1` 看 `run/dsh-check.txt` 是否写入。
 10. **终端点了没输出 / 停不下来** → 危险命令会停在「确认执行」那一步（红条），不点它不会执行；
    「停止」杀的是整棵进程树之外的单进程（PowerShell 起的子进程可能残留，重跑一次即可）。
+11. **系统卡顿 / 任务管理器里 `msedgewebview2` 占用几 GB** → 这是面板内嵌页面的渲染进程，不是 DSH 服务
+   （服务是 `node … bin.js web`，通常几百 MB）。先**只重启面板**：托盘右键「退出面板」→ 再双击
+   `dsh-panel.cmd`；服务与当前 DSH 会话不会中断，渲染进程的内存随之释放。若重开后仍持续暴涨，
+   多半来自页面里的第三方插件或实验性 inspector（本机 `~/.dsh/profiles/web/package.json` 里的
+   `dsh-whale-atelier` / `@deepseek-ai/dsh-experimental-inspector-profile`），逐项停用定位；
+   也可以点顶栏「浏览器」按钮在系统浏览器里打开同一页（另一套进程，不占面板的内存）。
 
 ## 版本历史
 
@@ -585,6 +637,9 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 | v3.2 | 启动提速：start-service 直连 node bin.js（npx 兜底）+ 启动分段打点 + 试次阶梯与失败现场保留；`--port` 显式传递（修掉 config 端口不生效的隐患）；面板启动与依赖检测并行、过渡期 300ms 轮询；可选 V8 编译缓存钩子（实测无收益，默认关）；新增 defender-exclusions / clean-npx-cache / check-boot-perf / apply-panel-update |
 | v3.3 | 可靠性：端口冲突自动顺延 + 面板按 PID 校验采纳真实端口 + 重复启动直接复用；崩溃自动恢复改指数退避（5→300 秒）并以「连续健康 120 秒」复位；HTTP 健康检查（绕过代理，仅观测不重启）；日志被占用时自动改名；stop-dsh/check-boot-perf 跟随实际端口；新增更新提示（check-update.ps1，只提示不自动升级）与令牌鉴权的远程访问（start-remote.cmd + remote-proxy.mjs，HTTP+WebSocket 透传，默认关闭） |
 | v3.4.1 | 端口采纳收紧：`SyncActivePort` 现在**必须**有可验证的 pid 才采纳 `run/dsh-web.port`（此前 pid 读不到时只要求端口在监听，「残留 port 文件 + 别的程序占了该端口」会让内嵌浏览器导航到别人的服务）；pid 文件失效时一并删除端口记录。新增 `check-scripts.ps1` 编码/语法门禁并接入 `run-tests.cmd` 第一步 |
+| v3.9.2 | **只开软件内页面 + 浏览器按钮**：dsh 0.2.x 的 `dsh web` 默认会在端口就绪时自己打开系统浏览器，与面板内嵌页面叠成「软件内 + 浏览器内」两个窗口。启动链路（`dsh-launch.mjs` / `start-service.ps1`）现按已装版本给 `web` 传 `--no-open`（0.1.x 不认识该开关，保持原行为；`check-boot-perf.ps1 -BootTest` 同步处理）；顶栏新增「浏览器」按钮（托盘/设置页入口保留），按需打开当前页面，并复用 `ResolveNavUrl()` 取带 launch token 的地址，0.2.x 不会被鉴权页挡住。**同版修掉任务页闪烁**：`session-reader.mjs` 原先只认旧的 `session.jsonl.zstd`，读不到 0.2.x 的 `session.v4.jsonl.zstd`，会在旧会话之间来回绑定（已完成数 9/17 闪动、列内容忽有忽无）；现在两种文件名都认，坏帧只跳过一次而不是每 800ms 重读整个文件（后者也是任务页 CPU 占用的来源）；任务看板的 DOM 重建合并到 200ms 一次（一轮对话上千条工具事件不再逐条重绘） |
+| v3.9.1 | **「更新插件」修好**：脚本先读 profile 的 `dependencies`（为空 → `note=no-plugins` 直接返回，不启动 pnpm、不造 `node_modules`/`pnpm-lock.yaml`），pnpm 预检给出可执行提示（dsh 的 `pnpm was not found` 挂在 exit 127，Windows cmd 返回 1，永远打不出来），入口从「mtime 最新」改成「**版本号最高**」（与启动器/面板/`update-dsh.ps1` 一致），加 600s 硬超时与 `detail=` 诊断字段；面板侧点下去立刻切「更新中…」、复用进度窗口看 `run/update-plugins.log`、成功后问是否重启，并把 `ERR_PNPM_FETCH_404`／`allow-version` 提示带进弹窗 |
+| v3.9 | **升级可见 + 0.2.x 鉴权**：升级时弹进度窗口（marquee 进度条 + 已用秒数 + `run/update-apply.log` 实时尾部，「在后台继续」只隐藏不中断），「检查更新」立刻切「检查中…」；`dsh 0.2.x` 新增浏览器会话鉴权，面板改从 `logs/dsh-web.log` 解析带 launch token 的地址导航（`ResolveNavUrl`），被挡下时自动重读令牌重试（≤2 次/代），顶栏与日志只写裸地址；顺手修掉自绘 `SmallButton` 因缺 `SingleLine` 在窄列/高 DPI 下把「检查更新」折成两行叠字的问题（并给更新区按钮加 `AutoWidth` 按文字测宽） |
 | v3.8 | **更新 DSH**：启动自动查新版（12 秒后、24h 节流），有新版在顶栏「设置」按钮右上角**亮红点** + 托盘气泡；设置页新增「DeepSeek Harness 更新」分区（当前/最新/上次检查 + 检查更新 / 更新到最新版 / 更新插件）。升级本体走新脚本 `update-dsh.ps1`（npx 显式 `@<版本>` 预热、先备份 `~/.dsh/sessions`、结果写 `run/update-check.txt`、过程写 `run/update-apply.log`，脚本不重启服务，成功后由面板询问重启）；插件走 `update-plugins.ps1`（`dsh plugin --profile web update`）。`check-update.ps1` 增加版本比较与 `-WithTags`；启动器/面板/启动器的入口定位由「mtime 最新」改为「**版本最高**」 |
 | v3.7.2 | 修掉顶栏「工作台 / 设置」按钮外面的**方形外框**（鼠标移上去又消失）：把这两个按钮和状态胶囊从 `Button` 改成自绘 `Control`——`Button` 即使 `FlatStyle=Flat` + `BorderSize=0`，在窗口重新激活或高 DPI 重绘时仍可能露出系统画的方框；自绘 `Control` 没有 `FlatAppearance`/`BorderStyle` 这类属性，且常态**既无边框也无底色**（只有文字，悬停才浮出浅蓝底）。`Click` 由 `OnMouseUp` 自己发（关掉 `StandardClick` 防重复），已用真实鼠标点击验证「设置」仍能打开设置页 |
 | v3.7.1 | 修复设置页「重新检测」点了之后一直停在「检测中…」：检测本身 1 秒就返回（`run/dsh-check.txt` 写入 `installed`），但三处检测入口各写一遍、没有一处刷新设置页标签。现在统一走 `BeginDshCheck()`——防重入（连点不再起一堆 PowerShell）、检测中把按钮置灰并显示「检测中…」、结果回来经 `RefreshDshStatusLabels()` 刷新标签；已用 UI 自动化真点一次验证：`已就绪 → 检测中… → 已就绪` |

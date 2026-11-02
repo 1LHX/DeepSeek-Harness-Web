@@ -638,7 +638,9 @@
         S.agent.events = (S.agent.events || []).concat([ev]);
         if (S.agent.events.length > 400) { S.agent.events.shift(); }
       }
-      renderTasks();
+      // v3.9.2: 一轮对话会产生成百上千条 tool/call|result。每条都重建整块看板
+      // （三列卡片 + 活动流）会把渲染进程的 CPU/内存拉满，这里合并到 200ms 一次。
+      scheduleRenderTasks();
       updateFoot();
       return;
     }
@@ -648,8 +650,15 @@
       updateFoot();
       return;
     }
-    if (m.push === 'agent-idle') { S.agent.state = 'idle'; renderTasks(); updateFoot(); return; }
+    if (m.push === 'agent-idle') { S.agent.state = 'idle'; scheduleRenderTasks(); updateFoot(); return; }
     if (m.push === 'agent-note') { termWrite('[工作台] ' + (m.text || '') + '\n', 'wb-sys'); return; }
+  }
+
+  // 合并高频的看板重绘（见 agent-ev 分支）；状态在渲染时读取，永远是最新值。
+  var tasksRenderTimer = null;
+  function scheduleRenderTasks() {
+    if (tasksRenderTimer) { return; }
+    tasksRenderTimer = setTimeout(function () { tasksRenderTimer = null; renderTasks(); }, 200);
   }
 
   // ---------------------------------------------------------------- 小工具
