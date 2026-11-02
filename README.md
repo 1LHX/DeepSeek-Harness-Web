@@ -199,7 +199,7 @@ v3.5 起还认两个可选键（都不是必需）：
 冷启动（开机后第一次打开面板）慢的根因不是某处 bug，而是**冷态成本被串行叠加**：
 PowerShell 启动 → 两次 `npm` 探测 → `npx`（等于再启动一遍 npm）→ node 加载上万个
 JS 小文件（首次触碰还要过实时保护扫描）→ WebView2 冷启动 → 前端 1.2 MB + 38 个插件
-bundle。
+bundle（这是当时 0.1.x 的规模；0.2.x 的插件 bundle 更大，用 `check-boot-perf.ps1` 看当前值）。
 
 ### 本机实测（2026-10-29，同一台机器，重启后各测一次）
 
@@ -394,9 +394,10 @@ stop-dsh.cmd --dry-run  # 预览将要终止的进程，不实际执行
 ### 任务看板为什么能「自动生成任务卡」
 
 DSH 把每一次会话事件追加进
-`%USERPROFILE%\.dsh\sessions\<编码后的cwd>\session-<id>\session.jsonl.zstd`——注意它是**一串独立的
-zstd 帧**（每次追加一个新帧，Node 的 `zstdDecompressSync` 只解第一帧）。`workbench/session-reader.mjs` 按魔数
-切帧、逐帧解压，把这几类记录翻成看板：
+`%USERPROFILE%\.dsh\sessions\<编码后的cwd>\session-<id>\session.jsonl.zstd`（0.2.x 为
+`session.v4.jsonl.zstd`；边车两种都认）——注意它是**一串独立的 zstd 帧**（每次追加一个新帧，
+Node 的 `zstdDecompressSync` 只解第一帧）。`workbench/session-reader.mjs` 按魔数切帧、逐帧解压，
+把这几类记录翻成看板：
 
 **为什么不再只认 `todo_write`**：v3.5 的看板只读 Agent 的清单，实测踩过——Agent 某一轮不写清单时
 「待规划 / 进行中」永远是空的，看起来像看板坏了。v3.6 起骨架是**轮次卡**（一定会有的东西）：
@@ -533,7 +534,7 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 
 ### 关于文章里那条「npx 重跑就是升级」
 
-不准确。npx 会**复用缓存里已满足的版本**——只写 `npx @deepseek-ai/dsh web` 时，缓存里已有 0.1.0-rc.7 就还是 0.1.0-rc.7。
+不准确。npx 会**复用缓存里已满足的版本**——只写 `npx @deepseek-ai/dsh web` 时，缓存里已有 0.2.1-rc.5 就还是 0.2.1-rc.5。
 要真正升级必须显式给版本/标签：`npx --yes @deepseek-ai/dsh@latest --version`（本脚本就是这么做的）。
 另外：本机是 **npx 模式**（没有全局 `dsh`），所以走「npx 预热新版本 + 启动器按版本最高选入口」这条路；
 若你以后改成全局安装（`npm i -g @deepseek-ai/dsh`），同一条命令也能工作，启动器同样会挑到最新那份。
@@ -543,13 +544,14 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 ### rc 号怎么读
 
 `0.2.1-rc.5` = 0.2.1 正式版之前的第 5 个候选版；比较时**数字段优先**，同号时预发布版比正式版小、预发布之间按尾部数字比。
-本机实测（2026-11-02）：当前 `0.1.0-rc.7`，npm `latest` = `0.2.1-rc.5`，`next` = `0.2.1-rc.5`，`alpha` = `0.2.2-alpha.2`。
+本机实测（2026-11-02）：当前已升级到 `0.2.1-rc.5`，npm `latest` = `0.2.1-rc.5`，`next` = `0.2.1-rc.5`，`alpha` = `0.2.2-alpha.2`。
 
 ### 排障
 
 - 红点在但设置页说「已是最新」→ 点一次「检查更新」（旧结果缓存了 24 小时）；
 - 「更新到最新版」失败 → 看 `run/update-apply.log`：常见是网络/镜像（`npm view` 不通）或下载超时，重试即可；
 - 升完版本没变 → 说明 npx 缓存里已有该版本但入口没切过去；确认 `run/update-check.txt` 的 `copies=`，必要时重启面板（启动器按版本最高重新选入口）。
+
 ## 界面设计规范（v3.7）
 
 整套界面（WinForms 顶栏 / 设置页 / 日志窗口 / 托盘 + 工作台抽屉 + 占位页 + 应用图标）共用一套 token：
@@ -600,6 +602,7 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 1. 只改 `dsh-panel.cs` 的 `Theme`（颜色 / 圆角 / 间距），以及 `workbench/ui.html` 里 `--wb-*` 那组变量；
 2. 图标改 `generate-icon.ps1` 并重跑（几何与 `Ui.DrawLogo` 保持一致）；
 3. 跑 `build-dsh-panel.cmd` + `check-scripts.ps1`，工作台再跑 `node workbench/smoke.mjs`。
+
 ## 排障
 
 1. 服务起不来 → 查看 `logs\dsh-web.err.log`（面板日志区也会显示）；
