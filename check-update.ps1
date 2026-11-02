@@ -21,7 +21,8 @@
 param(
     [switch]$Force,
     [int]$MaxAgeHours = 24,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$WithTags
 )
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -32,7 +33,7 @@ $out = Join-Path $runDir 'update-check.txt'
 
 function Write-Result([hashtable]$fields) {
     $lines = New-Object System.Collections.ArrayList
-    foreach ($k in @('current', 'latest', 'upgrade', 'checked', 'error')) {
+    foreach ($k in @('current', 'latest', 'next', 'alpha', 'upgrade', 'copies', 'checked', 'error')) {
         if ($fields.ContainsKey($k)) { [void]$lines.Add($k + '=' + $fields[$k]) }
     }
     Set-Content -LiteralPath $out -Value ($lines -join "`r`n") -Encoding UTF8
@@ -54,8 +55,44 @@ if (-not $Force -and (Test-Path -LiteralPath $out)) {
     }
 }
 
-# ---- 定位已安装的 dsh（与 start-service.ps1 相同的顺序） ----
-function Resolve-DshPackageJson {
+# ---- 版本比较 ----
+# 主.次.修订 数字优先；同号时预发布版（rc/beta）比正式版小，预发布之间按尾部数字比。
+# 例：0.1.0-rc.7 < 0.2.1-rc.5（数字段）；0.2.1-rc.5 < 0.2.1（预发布更小）。
+function ConvertTo-VersionKey([string]$v) {
+    if (-not $v) { return $null }
+    $main = $v
+    $pre = ""
+    $dash = $v.IndexOf([char]45)
+    if ($dash -ge 0) { $main = $v.Substring(0, $dash); $pre = $v.Substring($dash + 1) }
+    $parts = $main.Split([char]46)
+    $nums = @(0, 0, 0)
+    for ($i = 0; $i -lt 3 -and $i -lt $parts.Count; $i++) {
+        $tmp = 0
+        if ([int]::TryParse($parts[$i], [ref]$tmp)) { $nums[$i] = $tmp }
+    }
+    $preNum = 0
+    if ($pre) {
+        $m = [regex]::Match($pre, "([0-9]+)$")
+        if ($m.Success) { $tmp2 = 0; if ([int]::TryParse($m.Groups[1].Value, [ref]$tmp2)) { $preNum = $tmp2 } }
+    }
+    return [pscustomobject]@{ Major = $nums[0]; Minor = $nums[1]; Patch = $nums[2]; Pre = $(if ($pre) { 1 } else { 0 }); PreNum = $preNum; Raw = $v }
+}
+
+function Test-VersionNewer([string]$a, [string]$b) {
+    $ka = ConvertTo-VersionKey $a
+    $kb = ConvertTo-VersionKey $b
+    if (-not $ka) { return $false }
+    if (-not $kb) { return $true }
+    if ($ka.Major -ne $kb.Major) { return ($ka.Major -gt $kb.Major) }
+    if ($ka.Minor -ne $kb.Minor) { return ($ka.Minor -gt $kb.Minor) }
+    if ($ka.Patch -ne $kb.Patch) { return ($ka.Patch -gt $kb.Patch) }
+    if ($ka.Pre -ne $kb.Pre) { return ($ka.Pre -lt $kb.Pre) }
+    return ($ka.PreNum -gt $kb.PreNum)
+}
+
+# ---- 列出所有已安装副本（npx 缓存每个目录一份 + 全局 npm + node 旁） ----
+# 取「版本最高」的那份当 current：npx 缓存里可能同时存在 rc.6/rc.7，按 mtime 会选错。
+function Get-DshCopies {
     $paths = New-Object System.Collections.ArrayList
     $npxRoot = Join-Path $env:LOCALAPPDATA 'npm-cache\_npx'
     if (Test-Path -LiteralPath $npxRoot) {
@@ -64,21 +101,26 @@ function Resolve-DshPackageJson {
         }
     }
     [void]$paths.Add((Join-Path $env:APPDATA 'npm\node_modules\@deepseek-ai\dsh\package.json'))
-    $best = $null
-    $bestTime = [datetime]::MinValue
-    foreach ($p in $paths) {
-        if ($p -and (Test-Path -LiteralPath $p)) {
-            $t = (Get-Item -LiteralPath $p).LastWriteTimeUtc
-            if ((-not $best) -or ($t -gt $bestTime)) { $best = $p; $bestTime = $t }
-        }
+    $nodeExe = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+    if ($nodeExe) {
+        [void]$paths.Add((Join-Path (Split-Path -Parent $nodeExe) 'node_modules\@deepseek-ai\dsh\package.json'))
     }
-    return $best
+    $list = New-Object System.Collections.ArrayList
+    foreach ($p in $paths) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        try {
+            $v = (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json).version
+            if ($v) { [void]$list.Add([pscustomobject]@{ Path = $p; Version = $v }) }
+        } catch { }
+    }
+    return ,$list
 }
 
 $current = ''
-$pkg = Resolve-DshPackageJson
-if ($pkg) {
-    try { $current = (Get-Content -LiteralPath $pkg -Raw | ConvertFrom-Json).version } catch { }
+$copies = @()
+foreach ($c in (Get-DshCopies)) {
+    $copies += $c.Version
+    if (-not $current -or (Test-VersionNewer $c.Version $current)) { $current = $c.Version }
 }
 
 # ---- 查 npm 上的最新版本 ----
@@ -105,8 +147,28 @@ foreach ($npm in $npmCandidates) {
 }
 if (-not $latest -and -not $err) { $err = '查询失败：找不到可用的 npm' }
 
+# ---- 可选：拿 dist-tags（latest / next / alpha）----
+$nextTag = ''
+$alphaTag = ''
+if ($WithTags) {
+    foreach ($npm in $npmCandidates) {
+        if (-not (Get-Command $npm -ErrorAction SilentlyContinue)) { continue }
+        $raw = & $npm view '@deepseek-ai/dsh' dist-tags --json --fetch-timeout=8000 --fetch-retries=0 2>$null
+        if ($LASTEXITCODE -eq 0 -and $raw) {
+            try {
+                $tags = ($raw -join ' ') | ConvertFrom-Json
+                if ($tags.latest) { $latest = $tags.latest }
+                if ($tags.next) { $nextTag = $tags.next }
+                if ($tags.alpha) { $alphaTag = $tags.alpha }
+                break
+            } catch { }
+        }
+    }
+}
+
 $upgrade = 'no'
-if ($current -and $latest -and ($current -ne $latest)) { $upgrade = 'yes' }
+if ($current -and $latest -and (Test-VersionNewer $latest $current)) { $upgrade = 'yes' }
+elseif ($current -and $latest -and ($current -ne $latest)) { $upgrade = 'yes' }
 
 $fields = @{
     current = $(if ($current) { $current } else { 'unknown' })
@@ -114,6 +176,9 @@ $fields = @{
     upgrade = $(if ($err) { 'unknown' } else { $upgrade })
     checked = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK')
 }
+if ($nextTag) { $fields['next'] = $nextTag }
+if ($alphaTag) { $fields['alpha'] = $alphaTag }
+if ($copies.Count -gt 0) { $fields['copies'] = ($copies -join ',') }
 if ($err) { $fields['error'] = $err }
 Write-Result $fields
 

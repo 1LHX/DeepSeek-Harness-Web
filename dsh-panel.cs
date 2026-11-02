@@ -78,6 +78,12 @@
 //       系统画的方形外框（鼠标移上去被我们的填充盖住，于是"悬停就消失"）。自绘 Control 没有
 //       FlatAppearance/BorderStyle 这类属性，且常态**既无边框也无底色**（只有文字，悬停浮出
 //       浅蓝底），从根上杜绝这类方框；Click 由 OnMouseUp 自己发（StandardClick 关掉，避免重复）。
+// v3.8（更新 DSH）：启动 12 秒后自动查新版（check-update.ps1，24h 节流），有新版就在顶栏
+//       「设置」按钮右上角亮红点（SmallButton.HasBadge），托盘也弹一次气泡；设置页新增
+//       「DeepSeek Harness 更新」分区：当前/最新/上次检查 + 检查更新 / 更新到最新版 / 更新插件。
+//       升级走 update-dsh.ps1（npx 预热 @<版本>、先备份 ~/.dsh/sessions、结果写 run/update-*.txt，
+//       脚本不重启服务，由面板在成功后询问重启）；插件另走 update-plugins.ps1（dsh plugin update）。
+//       入口定位改为「按版本最高」（原来按 mtime），否则升级后新副本可能不是被选中的那份。
 // 注意：csc v4.0.30319 只支持 C# 5.0，勿使用字符串插值 / ?. / 表达式体等新语法。
 
 using System;
@@ -101,8 +107,8 @@ using Microsoft.Web.WebView2.WinForms;
 [assembly: AssemblyProduct("dsh-panel")]
 [assembly: AssemblyDescription("Control panel for DeepSeek Harness Web")]
 [assembly: AssemblyCompany("")]
-[assembly: AssemblyVersion("3.7.2.0")]
-[assembly: AssemblyFileVersion("3.7.2.0")]
+[assembly: AssemblyVersion("3.8.0.0")]
+[assembly: AssemblyFileVersion("3.8.0.0")]
 
 namespace DshPanel
 {
@@ -664,6 +670,12 @@ namespace DshPanel
         // 启动脚本并轮询结果文件（后台线程；超时返回 false）
         static bool RunScriptWaitResult(string script, string resultFile, int timeoutMs, out string result)
         {
+            return RunScriptWaitResult(script, resultFile, timeoutMs, out result, null);
+        }
+
+        // extraArgs：附加脚本参数（如 "-Force -WithTags" / "-Apply"），已过滤双引号
+        static bool RunScriptWaitResult(string script, string resultFile, int timeoutMs, out string result, string extraArgs)
+        {
             result = null;
             try
             {
@@ -673,6 +685,7 @@ namespace DshPanel
                 // 否则轮询可能读到旧缓存而秒回，未反映真实状态
                 try { File.Delete(resultFile); } catch { }
                 string parameters = "-NoProfile -ExecutionPolicy Bypass -File \"" + helper + "\"";
+                if (!string.IsNullOrEmpty(extraArgs)) parameters += " " + extraArgs.Replace("\"", "");
                 IntPtr r = ShellExecuteW(IntPtr.Zero, "open", "powershell.exe", parameters, ScriptRoot, 0);
                 if (r.ToInt64() <= 32) return false;
                 long start = Environment.TickCount;
@@ -863,9 +876,130 @@ namespace DshPanel
 
         // check-update.ps1 走 npm 自己的镜像/代理配置，结果按 24 小时节流写
         // run/update-check.txt；这里只负责跑脚本、读结论、上报一句话。
+        // ---------- v3.8：DSH 版本与更新（红色角标 + 设置页更新） ----------
+        internal static bool updateAvailable;          // 有新版 -> 设置按钮亮红点
+        internal static string updateCurrent = "";
+        internal static string updateLatest = "";
+        internal static string updateNext = "";
+        internal static string updateAlpha = "";
+        internal static string updateChecked = "";
+        internal static string updateError = "";
+        internal static string updateApplied = "";     // 最近一次升级的结果：yes / no
+        internal static bool updateBusy;               // 正在检查或升级（防重入）
+
+        // 版本比较：数字段优先；同号时预发布版（rc/beta）比正式版小，预发布之间按尾部数字比。
+        // 返回 >0 表示 a 比 b 新。例：0.1.0-rc.7 < 0.2.1-rc.5；0.2.1-rc.5 < 0.2.1。
+        internal static int CompareDshVersion(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) && string.IsNullOrEmpty(b)) return 0;
+            if (string.IsNullOrEmpty(a)) return -1;
+            if (string.IsNullOrEmpty(b)) return 1;
+            int[] ka = SplitVersion(a);
+            int[] kb = SplitVersion(b);
+            for (int i = 0; i < 3; i++)
+            {
+                if (ka[i] != kb[i]) return ka[i] < kb[i] ? -1 : 1;
+            }
+            if (ka[3] != kb[3]) return ka[3] < kb[3] ? 1 : -1;   // 0=正式版（更新） 1=预发布
+            if (ka[4] != kb[4]) return ka[4] < kb[4] ? -1 : 1;
+            return 0;
+        }
+
+        static int[] SplitVersion(string v)
+        {
+            int[] r = new int[5];
+            if (string.IsNullOrEmpty(v)) return r;
+            string main = v;
+            string pre = "";
+            int dash = v.IndexOf('-');
+            if (dash >= 0) { main = v.Substring(0, dash); pre = v.Substring(dash + 1); }
+            string[] parts = main.Split('.');
+            for (int i = 0; i < 3 && i < parts.Length; i++)
+            {
+                int n;
+                if (int.TryParse(parts[i], out n)) r[i] = n;
+            }
+            if (pre.Length > 0)
+            {
+                r[3] = 1;
+                System.Text.RegularExpressions.Match m =
+                    System.Text.RegularExpressions.Regex.Match(pre, "([0-9]+)$");
+                if (m.Success)
+                {
+                    int n;
+                    if (int.TryParse(m.Groups[1].Value, out n)) r[4] = n;
+                }
+            }
+            return r;
+        }
+
+        // 从 <pkg>\lib\bin.js 推出 <pkg>\package.json 里的 version
+        internal static string ReadDshVersion(string binJs)
+        {
+            try
+            {
+                string pkgDir = Path.GetDirectoryName(Path.GetDirectoryName(binJs));
+                if (string.IsNullOrEmpty(pkgDir)) return null;
+                string pkgJson = Path.Combine(pkgDir, "package.json");
+                if (!File.Exists(pkgJson)) return null;
+                string text = File.ReadAllText(pkgJson);
+                System.Text.RegularExpressions.Match m =
+                    System.Text.RegularExpressions.Regex.Match(text, @"""version""\s*:\s*""([^""]+)""");
+                return m.Success ? m.Groups[1].Value : null;
+            }
+            catch { return null; }
+        }
+
+        // 读 run/update-check.txt 到 static 字段（检查/升级结束后都调一次）
+        internal static void LoadUpdateState()
+        {
+            try
+            {
+                string resultFile = Path.Combine(ScriptRoot, "run", "update-check.txt");
+                if (!File.Exists(resultFile)) return;
+                string current = null, latest = null, next = null, alpha = null, upgrade = null, error = null, checkedAt = null, applied = null;
+                foreach (string line in File.ReadAllLines(resultFile))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string k = line.Substring(0, eq).Trim();
+                    string v = line.Substring(eq + 1).Trim();
+                    if (k == "current") current = v;
+                    else if (k == "latest") latest = v;
+                    else if (k == "next") next = v;
+                    else if (k == "alpha") alpha = v;
+                    else if (k == "upgrade") upgrade = v;
+                    else if (k == "error") error = v;
+                    else if (k == "checked") checkedAt = v;
+                    else if (k == "applied") applied = v;
+                }
+                updateCurrent = current ?? "";
+                updateLatest = latest ?? "";
+                updateNext = next ?? "";
+                updateAlpha = alpha ?? "";
+                updateChecked = checkedAt ?? "";
+                updateError = error ?? "";
+                updateApplied = applied ?? "";
+                updateAvailable = upgrade == "yes";
+            }
+            catch { }
+        }
+
         // 严禁在这里做任何安装动作：升级必须由用户自己确认执行（README 里给了命令）。
         internal static void CheckUpdateAsync(Action<string> done)
         {
+            CheckUpdateAsync(done, false);
+        }
+
+        // force = true：跳过 24 小时节流，并多取 dist-tags（设置页「检查更新」用）
+        internal static void CheckUpdateAsync(Action<string> done, bool force)
+        {
+            if (updateBusy)
+            {
+                if (done != null) { try { done("更新检查正在进行中，稍等…"); } catch { } }
+                return;
+            }
+            updateBusy = true;
             ThreadPool.QueueUserWorkItem(delegate
             {
                 string summary = null;
@@ -873,30 +1007,90 @@ namespace DshPanel
                 {
                     string resultFile = Path.Combine(ScriptRoot, "run", "update-check.txt");
                     string ignored;
-                    RunScriptWaitResult("check-update.ps1", resultFile, 45000, out ignored);
+                    RunScriptWaitResult("check-update.ps1", resultFile, force ? 90000 : 45000, out ignored,
+                        force ? "-Force -WithTags" : null);
+                    LoadUpdateState();
+                    if (!string.IsNullOrEmpty(updateError)) summary = "更新检查未完成：" + updateError;
+                    else if (updateAvailable) summary = "有新版本可用：" + updateCurrent + " → " + updateLatest;
+                    else if (!string.IsNullOrEmpty(updateCurrent)) summary = "已是最新版本：" + updateCurrent;
+                }
+                catch { }
+                updateBusy = false;
+                if (done != null)
+                {
+                    try { done(summary); } catch { }
+                }
+            });
+        }
+
+        // 更新插件（另一条升级线）：update-plugins.ps1 -> dsh plugin --profile web update
+        internal static void RunPluginUpdateAsync(Action<bool, string> done)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool ok = false;
+                string summary = null;
+                try
+                {
+                    string resultFile = Path.Combine(ScriptRoot, "run", "update-plugins.txt");
+                    string ignored;
+                    RunScriptWaitResult("update-plugins.ps1", resultFile, 900000, out ignored);
                     if (File.Exists(resultFile))
                     {
-                        string current = null, latest = null, upgrade = null, error = null;
                         foreach (string line in File.ReadAllLines(resultFile))
                         {
                             int eq = line.IndexOf('=');
                             if (eq <= 0) continue;
                             string k = line.Substring(0, eq).Trim();
                             string v = line.Substring(eq + 1).Trim();
-                            if (k == "current") current = v;
-                            else if (k == "latest") latest = v;
-                            else if (k == "upgrade") upgrade = v;
-                            else if (k == "error") error = v;
+                            if (k == "ok") ok = v == "yes";
+                            else if (k == "error") summary = v;
                         }
-                        if (error != null) summary = "更新检查未完成：" + error;
-                        else if (upgrade == "yes") summary = "有新版本可用：" + current + " → " + latest;
-                        else summary = "已是最新版本：" + current;
                     }
+                    if (ok) summary = "插件已更新（重启服务后生效）";
+                    else if (string.IsNullOrEmpty(summary)) summary = "插件更新未完成（见 run/update-plugins.log）";
                 }
-                catch { }
+                catch (Exception ex) { summary = "插件更新失败：" + ex.Message; }
                 if (done != null)
                 {
-                    try { done(summary); } catch { }
+                    try { done(ok, summary); } catch { }
+                }
+            });
+        }
+
+        // 真升级（只有用户在设置页点「更新到最新版」才会调用）：update-dsh.ps1 -Apply
+        // 脚本内部先备份 ~/.dsh/sessions，再用 npx 预热 @latest；完成后由面板重启服务。
+        internal static void ApplyUpdateAsync(Action<bool, string> done)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool ok = false;
+                string summary = null;
+                try
+                {
+                    string resultFile = Path.Combine(ScriptRoot, "run", "update-check.txt");
+                    string ignored;
+                    // 首次会真的下载一份新包，给足 15 分钟；结果文件在脚本末尾写入
+                    RunScriptWaitResult("update-dsh.ps1", resultFile, 900000, out ignored, "-Apply");
+                    LoadUpdateState();
+                    if (updateApplied == "yes")
+                    {
+                        ok = true;
+                        summary = "已更新到 " + updateCurrent;
+                    }
+                    else if (!string.IsNullOrEmpty(updateError))
+                    {
+                        summary = "更新失败：" + updateError;
+                    }
+                    else
+                    {
+                        summary = "更新未生效（当前仍是 " + (string.IsNullOrEmpty(updateCurrent) ? "未知" : updateCurrent) + "）";
+                    }
+                }
+                catch (Exception ex) { summary = "更新失败：" + ex.Message; }
+                if (done != null)
+                {
+                    try { done(ok, summary); } catch { }
                 }
             });
         }
@@ -909,28 +1103,20 @@ namespace DshPanel
         {
             try
             {
+                List<string> candidates = new List<string>();
                 string npxRoot = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "npm-cache", "_npx");
-                string best = null;
-                DateTime bestTime = DateTime.MinValue;
                 if (Directory.Exists(npxRoot))
                 {
                     foreach (string d in Directory.GetDirectories(npxRoot))
                     {
-                        string cand = Path.Combine(d, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
-                        if (!File.Exists(cand)) continue;
-                        DateTime t = File.GetLastWriteTimeUtc(cand);
-                        if (best == null || t > bestTime) { best = cand; bestTime = t; }
+                        candidates.Add(Path.Combine(d, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"));
                     }
                 }
-                if (best != null) return best;
-
-                string global = Path.Combine(
+                candidates.Add(Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "npm", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
-                if (File.Exists(global)) return global;
-
+                    "npm", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"));
                 // node.exe 所在目录下的 node_modules（npm install 到 node 目录的情形）
                 try
                 {
@@ -938,11 +1124,34 @@ namespace DshPanel
                     if (File.Exists(npxCli))
                     {
                         string nodeDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(npxCli)));
-                        string beside = Path.Combine(nodeDir, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
-                        if (File.Exists(beside)) return beside;
+                        candidates.Add(Path.Combine(nodeDir, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"));
                     }
                 }
                 catch { }
+
+                // v3.8：按**版本**选，而不是按 mtime——npx 缓存里可能同时躺着 rc.6 / rc.7，
+                // 升级后新副本的 mtime 一定更新，但按版本选才不会被"旧版本刚被 touch 过"骗到。
+                string best = null;
+                string bestVer = null;
+                DateTime bestTime = DateTime.MinValue;
+                for (int i = 0; i < candidates.Count; i++)
+                {
+                    string cand = candidates[i];
+                    if (string.IsNullOrEmpty(cand) || !File.Exists(cand)) continue;
+                    string ver = ReadDshVersion(cand);
+                    DateTime t = File.GetLastWriteTimeUtc(cand);
+                    if (best == null)
+                    {
+                        best = cand; bestVer = ver; bestTime = t;
+                        continue;
+                    }
+                    int cmp = CompareDshVersion(ver, bestVer);
+                    if (cmp > 0 || (cmp == 0 && t > bestTime))
+                    {
+                        best = cand; bestVer = ver; bestTime = t;
+                    }
+                }
+                return best;
             }
             catch { }
             return null;
@@ -1781,6 +1990,8 @@ namespace DshPanel
                 }
                 // v3.1：检测 DeepSeek Harness 是否可用——缺失则进入安装指引页
                 BeginDshCheck();
+                // v3.8：先吃上次的更新检查结果（有新版就立刻亮红点），12 秒后再联网刷新
+                try { Program.LoadUpdateState(); ApplyUpdateBadge(); } catch { }
                 // v3.3：更新提示——延迟 12 秒再查，绝不和启动抢时间（只提示，不自动升级）
                 if (Program.updateCheckEnabled)
                 {
@@ -1789,6 +2000,11 @@ namespace DshPanel
                         try { if (updateTimer != null) updateTimer.Dispose(); } catch { }
                         Program.CheckUpdateAsync(delegate(string summary)
                         {
+                            TryBeginInvoke(delegate
+                            {
+                                ApplyUpdateBadge();
+                                if (settingsWindow != null) { try { settingsWindow.RefreshUpdateStatus(); } catch { } }
+                            });
                             if (string.IsNullOrEmpty(summary)) return;
                             bool hasUpdate = summary.IndexOf("有新版本") >= 0;
                             Program.LogEvent(hasUpdate ? LogKind.Warn : LogKind.Info, summary);
@@ -1859,6 +2075,64 @@ namespace DshPanel
                     balloonShown = true;
                     try { notify.ShowBalloonTip(2500, "dsh-panel", "已最小化到系统托盘，服务仍在后台运行。", ToolTipIcon.Info); } catch { }
                 }
+            }
+        }
+
+        // ---------- v3.8：更新角标 / 更新后重启服务 ----------
+
+        // 有新版时在「设置」按钮右上角亮红点，并把提示写进 tooltip
+        internal void ApplyUpdateBadge()
+        {
+            try
+            {
+                if (btnSettings == null) return;
+                btnSettings.HasBadge = Program.updateAvailable;
+                string tip = Program.updateAvailable
+                    ? "有新版本可用：" + Program.updateCurrent + " → " + Program.updateLatest
+                      + "（设置 → DeepSeek Harness 更新）"
+                    : "设置";
+                if (capsuleTip != null) capsuleTip.SetToolTip(btnSettings, tip);
+            }
+            catch { }
+        }
+
+        // 升级后重启服务，让新版本真正生效（先停干净再起，避免两个版本抢端口）
+        internal void RestartServiceForUpdate()
+        {
+            try
+            {
+                if (Program.opState != Program.OpState.Idle)
+                {
+                    Program.LogEvent(LogKind.Warn, "服务正在启停中，等它结束后再重启");
+                    return;
+                }
+                Program.LogEvent(LogKind.Info, "更新完成，重启服务以加载新版本…");
+                Program.manualStop = false;
+                Program.StopServiceAsync();
+                int tries = 0;
+                System.Threading.Timer t = null;
+                t = new System.Threading.Timer(delegate(object st)
+                {
+                    tries++;
+                    try
+                    {
+                        if (Program.opState == Program.OpState.Idle && !Program.IsPortOpen())
+                        {
+                            try { t.Dispose(); } catch { }
+                            Program.LogEvent(LogKind.Info, "重新启动服务…");
+                            Program.StartServiceAsync();
+                        }
+                        else if (tries > 120)
+                        {
+                            try { t.Dispose(); } catch { }
+                        }
+                    }
+                    catch { try { t.Dispose(); } catch { } }
+                }, null, 700, 700);
+            }
+            catch (Exception ex)
+            {
+                Program.LogEvent(LogKind.Warn, "重启服务失败：" + ex.Message);
             }
         }
 
@@ -3045,6 +3319,11 @@ namespace DshPanel
         MainForm owner;
         Label lblDshStatus;
         SmallButton btnRecheck;
+        // v3.8：更新面板
+        Label lblUpdateStatus;
+        SmallButton btnUpdateCheck;
+        SmallButton btnUpdateApply;
+        SmallButton btnUpdatePlugins;
 
         public SettingsWindow(MainForm ownerForm)
         {
@@ -3073,6 +3352,56 @@ namespace DshPanel
         {
             base.OnShown(e);
             RefreshDshStatus();
+            RefreshUpdateStatus();
+        }
+
+        void BeginInvokeSafe(MethodInvoker action)
+        {
+            try { if (IsHandleCreated) BeginInvoke(action); } catch { }
+        }
+
+        // 更新面板状态（数据来自 Program 的 static 字段，检查/升级后由 MainForm 或本窗口触发刷新）
+        public void RefreshUpdateStatus()
+        {
+            if (lblUpdateStatus == null) return;
+            try
+            {
+                bool busy = Program.updateBusy;
+                if (btnUpdateCheck != null)
+                {
+                    btnUpdateCheck.Enabled = !busy;
+                    btnUpdateCheck.Text = busy ? "检查中…" : "检查更新";
+                }
+                if (btnUpdateApply != null)
+                {
+                    btnUpdateApply.Enabled = !busy && Program.updateAvailable;
+                    if (!busy) btnUpdateApply.Text = "更新到最新版";
+                }
+                if (btnUpdatePlugins != null) btnUpdatePlugins.Enabled = !busy;
+
+                string current = string.IsNullOrEmpty(Program.updateCurrent) ? "未知" : Program.updateCurrent;
+                string latest = string.IsNullOrEmpty(Program.updateLatest) ? "未知" : Program.updateLatest;
+                string checkedAt = string.IsNullOrEmpty(Program.updateChecked) ? "尚未检查" : Program.updateChecked.Replace('T', ' ');
+                string alpha = string.IsNullOrEmpty(Program.updateAlpha) ? "" : "（alpha 通道 " + Program.updateAlpha + "）";
+
+                if (!string.IsNullOrEmpty(Program.updateError))
+                {
+                    lblUpdateStatus.Text = "更新检查失败：" + Program.updateError + "\r\n当前版本 " + current + " · 上次检查 " + checkedAt;
+                    lblUpdateStatus.ForeColor = Theme.Amber;
+                }
+                else if (Program.updateAvailable)
+                {
+                    lblUpdateStatus.Text = "有新版本：" + current + " → " + latest + alpha + "\r\n上次检查 " + checkedAt +
+                        " · rc 是预览版，升级会自动备份会话";
+                    lblUpdateStatus.ForeColor = Theme.RedInk;
+                }
+                else
+                {
+                    lblUpdateStatus.Text = "已是最新版本：" + current + alpha + "\r\n上次检查 " + checkedAt;
+                    lblUpdateStatus.ForeColor = Theme.GreenInk;
+                }
+            }
+            catch { }
         }
 
         public void RefreshDshStatus()
@@ -3160,6 +3489,10 @@ namespace DshPanel
                 MakeInfoRow("远程访问", "默认关闭 · 需要时运行 start-remote.cmd（令牌鉴权，关闭窗口即收回）"),
                 MakeButtonRow(new string[] { "打开日志窗口", "打开日志目录", "打开系统浏览器", "清除浏览器缓存" })
             }));
+            body.Controls.Add(MakeSection("DeepSeek Harness 更新", new Control[] {
+                MakeUpdateStatusRow(),
+                MakeUpdateButtonRow()
+            }));
             body.Controls.Add(MakeSection("关于", new Control[] {
                 MakeAboutRow(),
                 MakeLinkRow("DeepSeek Harness 项目主页", "https://github.com/deepseek-ai/deepseek-harness")
@@ -3169,6 +3502,133 @@ namespace DshPanel
             layout.Controls.Add(lblTitle, 0, 0);
             layout.Controls.Add(scroll, 0, 1);
             Controls.Add(layout);
+        }
+
+        // ---------- v3.8：更新分区 ----------
+
+        Control MakeUpdateStatusRow()
+        {
+            lblUpdateStatus = new Label();
+            lblUpdateStatus.AutoSize = true;
+            lblUpdateStatus.MaximumSize = new Size(520, 0);
+            lblUpdateStatus.Font = new Font("Microsoft YaHei UI", 9F);
+            lblUpdateStatus.ForeColor = Theme.TextMuted;
+            lblUpdateStatus.Text = "读取更新状态…";
+            return lblUpdateStatus;
+        }
+
+        Control MakeUpdateButtonRow()
+        {
+            TableLayoutPanel row = new TableLayoutPanel();
+            row.Dock = DockStyle.Top;
+            row.AutoSize = true;
+            row.ColumnCount = 3;
+            row.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            for (int i = 0; i < 3; i++) row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            btnUpdateCheck = new SmallButton("检查更新");
+            btnUpdateCheck.Size = new Size(88, 26);
+            btnUpdateCheck.Margin = new Padding(0, 4, 8, 4);
+            btnUpdateCheck.Click += delegate { StartUpdateCheck(); };
+
+            btnUpdateApply = new SmallButton("更新到最新版");
+            btnUpdateApply.Size = new Size(112, 26);
+            btnUpdateApply.Margin = new Padding(0, 4, 8, 4);
+            btnUpdateApply.Click += delegate { StartUpdateApply(); };
+
+            btnUpdatePlugins = new SmallButton("更新插件");
+            btnUpdatePlugins.Size = new Size(84, 26);
+            btnUpdatePlugins.Margin = new Padding(0, 4, 0, 4);
+            btnUpdatePlugins.Click += delegate { StartPluginUpdate(); };
+
+            row.Controls.Add(btnUpdateCheck, 0, 0);
+            row.Controls.Add(btnUpdateApply, 1, 0);
+            row.Controls.Add(btnUpdatePlugins, 2, 0);
+            return row;
+        }
+
+        void StartUpdateCheck()
+        {
+            if (Program.updateBusy) return;
+            Program.LogEvent(LogKind.Info, "正在检查 DeepSeek Harness 新版本…");
+            Program.CheckUpdateAsync(delegate(string summary)
+            {
+                if (!string.IsNullOrEmpty(summary)) Program.LogEvent(LogKind.Info, summary);
+                BeginInvokeSafe(delegate
+                {
+                    RefreshUpdateStatus();
+                    if (owner != null) { try { owner.ApplyUpdateBadge(); } catch { } }
+                });
+            }, true);
+        }
+
+        void StartUpdateApply()
+        {
+            if (Program.updateBusy) return;
+            string cur = string.IsNullOrEmpty(Program.updateCurrent) ? "未知" : Program.updateCurrent;
+            string tgt = string.IsNullOrEmpty(Program.updateLatest) ? "最新版" : Program.updateLatest;
+            DialogResult r = MessageBox.Show(this,
+                "把 DeepSeek Harness 从 " + cur + " 升级到 " + tgt + " ？\r\n\r\n" +
+                "· 走 npx 通道：npx --yes @deepseek-ai/dsh@" + tgt + " --version（显式带版本号，npx 才会拉新版）\r\n" +
+                "· 升级前会自动备份会话到 %USERPROFILE%\\.dsh-sessions-backup-<时间戳>\r\n" +
+                "· 首次升级需要下载，可能 1~2 分钟；完成后会问你是否重启服务\r\n" +
+                "· 当前通道是 rc 预览版，接口可能变化，插件兼容性请自行确认",
+                "更新 DeepSeek Harness", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+            if (r != DialogResult.OK) return;
+
+            Program.updateBusy = true;
+            if (btnUpdateApply != null) btnUpdateApply.Text = "更新中…";
+            RefreshUpdateStatus();
+            Program.LogEvent(LogKind.Info, "开始更新 DeepSeek Harness（" + cur + " → " + tgt + "），详细过程见 run/update-apply.log");
+            Program.ApplyUpdateAsync(delegate(bool ok, string summary)
+            {
+                Program.updateBusy = false;
+                Program.LogEvent(ok ? LogKind.Success : LogKind.Error, summary);
+                BeginInvokeSafe(delegate
+                {
+                    RefreshUpdateStatus();
+                    if (owner != null) { try { owner.ApplyUpdateBadge(); } catch { } }
+                    if (ok)
+                    {
+                        DialogResult rr = MessageBox.Show(this,
+                            summary + "\r\n\r\n需要重启服务才能用上新版本。现在重启吗？（会话数据已备份）",
+                            "更新完成", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                        if (rr == DialogResult.Yes && owner != null) owner.RestartServiceForUpdate();
+                    }
+                    else
+                    {
+                        MessageBox.Show(this, summary + "\r\n\r\n详细日志：run\\update-apply.log",
+                            "更新未完成", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                });
+            });
+        }
+
+        void StartPluginUpdate()
+        {
+            if (Program.updateBusy) return;
+            DialogResult r = MessageBox.Show(this,
+                "更新 web profile 下的全部 DSH 插件？\r\n\r\n" +
+                "等价于：dsh plugin --profile web update（参数会转发给 profile 目录里的 pnpm）\r\n" +
+                "插件与 DSH 本体是两条升级线；更新后需要重启服务才生效。",
+                "更新 DSH 插件", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
+            if (r != DialogResult.OK) return;
+
+            Program.updateBusy = true;
+            RefreshUpdateStatus();
+            Program.LogEvent(LogKind.Info, "开始更新 DSH 插件（run/update-plugins.log）…");
+            Program.RunPluginUpdateAsync(delegate(bool ok, string summary)
+            {
+                Program.updateBusy = false;
+                Program.LogEvent(ok ? LogKind.Success : LogKind.Error, summary);
+                BeginInvokeSafe(delegate
+                {
+                    RefreshUpdateStatus();
+                    MessageBox.Show(this, summary + "\r\n\r\n日志：run\\update-plugins.log",
+                        ok ? "插件更新完成" : "插件更新未完成", MessageBoxButtons.OK,
+                        ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                });
+            });
         }
 
         // 分区卡片：标题 + 内容行
@@ -3767,11 +4227,19 @@ namespace DshPanel
         bool hovering;
         bool pressed;
         bool isOn;
+        bool hasBadge;
 
         public bool IsOn
         {
             get { return isOn; }
             set { isOn = value; Invalidate(); }
+        }
+
+        // v3.8：右上角红点（有新版 DSH 时亮在「设置」按钮上）
+        public bool HasBadge
+        {
+            get { return hasBadge; }
+            set { if (hasBadge != value) { hasBadge = value; Invalidate(); } }
         }
 
         public SmallButton(string text)
@@ -3825,6 +4293,22 @@ namespace DshPanel
             }
             TextRenderer.DrawText(g, Text, Font, ClientRectangle, fg,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+
+            if (hasBadge)
+            {
+                // 红点 + 一圈父容器底色的白环，任何底色上都清晰
+                int d = 7;
+                float bx = Width - d - 3F, by = 3F;
+                Color ringColor = (Parent != null && Parent.BackColor.A == 255) ? Parent.BackColor : Theme.Card;
+                using (SolidBrush ring = new SolidBrush(ringColor))
+                {
+                    g.FillEllipse(ring, bx - 2F, by - 2F, d + 4F, d + 4F);
+                }
+                using (SolidBrush dot = new SolidBrush(Theme.Red))
+                {
+                    g.FillEllipse(dot, bx, by, d, d);
+                }
+            }
         }
     }
 

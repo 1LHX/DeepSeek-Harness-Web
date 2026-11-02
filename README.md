@@ -63,6 +63,8 @@ v3.5 起顶栏多一个「工作台」（快捷键 F2）：文件、终端、任
 | `workbench/ui.html` | 工作台界面（单文件 HTML+CSS+JS，构建时内嵌进 exe，运行时注入 DSH 页面） |
 | `workbench/session-reader.mjs` | 会话事件流边车：解 zstd 帧、抽轮次卡（turn/start|end + tool/call）、todo 清单、排队消息（任务看板的数据源；缺失时其余页签照常用） |
 | `workbench/smoke.mjs` | 工作台自动化冒烟（CDP 驱动：挂载/桥接/五页签/轮次卡/抽屉宽度/终端策略/编辑-应用-回滚，20 项；需临时打开 `debugport`） |
+| `update-dsh.ps1` | 检查/升级 DeepSeek Harness 本体：按版本取当前、npm 取最新、备份会话、`npx --yes @deepseek-ai/dsh@<版本>` 预热、写 `run/update-*.txt` |
+| `update-plugins.ps1` | 更新 web profile 下的插件（`dsh plugin --profile web update`），结果写 `run/update-plugins.txt` |
 | **构建与测试** | |
 | `build-dsh-panel.cmd` | 编译脚本（csc /optimize+，引用 lib/ 的 WebView2 SDK，内嵌 `workbench/ui.html`，自动复制 loader） |
 | `apply-panel-update.cmd` | 改完 `.cs` 后一键「门禁 → 关面板 → 重编译 → 重开」（服务不停） |
@@ -439,6 +441,52 @@ v3.4 及以前的面板**自身不启动任何进程**（服务启动委托给 `
 CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本项目就是这样跑冒烟测试的）。
 **默认关闭**：开着的时候本机任何进程都能连上这个 WebView，等于拿到工作台的桥接口（写文件、执行命令）。
 
+## 更新 DeepSeek Harness（v3.8）
+
+面板会自己盯着版本，你只需要在设置页点按钮。
+
+### 自动检查与红点
+
+- 启动 12 秒后在后台跑 `check-update.ps1`（按 24 小时节流，结果写 `run/update-check.txt`）；
+- 有新版 → 顶栏「设置」按钮**右上角亮红点**（悬停 tooltip 写清 `当前 → 最新`），托盘同时弹一次气泡；
+- 升级成功后红点自动消失；降级/无网时只记 `error=`，不影响任何功能。
+
+### 设置页 → DeepSeek Harness 更新
+
+| 按钮 | 做什么 | 命令 / 脚本 |
+|---|---|---|
+| 检查更新 | 跳过节流立刻查，并多取 `dist-tags`（latest / next / alpha） | `check-update.ps1 -Force -WithTags` |
+| 更新到最新版 | 确认后升级本体（默认 latest 通道） | `update-dsh.ps1 -Apply` |
+| 更新插件 | 升 web profile 下的插件（另一条升级线） | `update-plugins.ps1` → `dsh plugin --profile web update` |
+
+升级本体这条链做的事（都在 `update-dsh.ps1` 里，面板只负责点按钮和重启服务）：
+
+1. **查当前**：扫 npx 缓存 + 全局 npm + node 旁的每一份 `@deepseek-ai/dsh`，**按版本号取最高**（不是按 mtime——缓存里常常同时躺着 rc.6 / rc.7）；
+2. **查最新**：`npm view @deepseek-ai/dsh@latest version`（走 npm 自己的镜像/代理配置，15 秒超时）；
+3. **备份会话**：`Copy-Item ~/.dsh/sessions → ~/.dsh-sessions-backup-<时间戳>`（rc 预览版升级前的保险，失败只告警不阻断）；
+4. **升级**：`npx --yes @deepseek-ai/dsh@<目标版本> --version`；
+5. **验证**：重新扫版本 → 写入 `run/update-check.txt`（`applied=yes|no`）；过程全量记 `run/update-apply.log`；
+6. **重启**：面板弹窗问「现在重启吗」，选是就先停干净再起（新版本才会生效）。
+
+### 关于文章里那条「npx 重跑就是升级」
+
+不准确。npx 会**复用缓存里已满足的版本**——只写 `npx @deepseek-ai/dsh web` 时，缓存里已有 0.1.0-rc.7 就还是 0.1.0-rc.7。
+要真正升级必须显式给版本/标签：`npx --yes @deepseek-ai/dsh@latest --version`（本脚本就是这么做的）。
+另外：本机是 **npx 模式**（没有全局 `dsh`），所以走「npx 预热新版本 + 启动器按版本最高选入口」这条路；
+若你以后改成全局安装（`npm i -g @deepseek-ai/dsh`），同一条命令也能工作，启动器同样会挑到最新那份。
+
+源码构建（`git pull + pnpm install + pnpm run build`）不在这两个脚本范围内——那种安装就按仓库自己的流程升级，面板只负责读版本号。
+
+### rc 号怎么读
+
+`0.2.1-rc.5` = 0.2.1 正式版之前的第 5 个候选版；比较时**数字段优先**，同号时预发布版比正式版小、预发布之间按尾部数字比。
+本机实测（2026-11-02）：当前 `0.1.0-rc.7`，npm `latest` = `0.2.1-rc.5`，`next` = `0.2.1-rc.5`，`alpha` = `0.2.2-alpha.2`。
+
+### 排障
+
+- 红点在但设置页说「已是最新」→ 点一次「检查更新」（旧结果缓存了 24 小时）；
+- 「更新到最新版」失败 → 看 `run/update-apply.log`：常见是网络/镜像（`npm view` 不通）或下载超时，重试即可；
+- 升完版本没变 → 说明 npx 缓存里已有该版本但入口没切过去；确认 `run/update-check.txt` 的 `copies=`，必要时重启面板（启动器按版本最高重新选入口）。
 ## 界面设计规范（v3.7）
 
 整套界面（WinForms 顶栏 / 设置页 / 日志窗口 / 托盘 + 工作台抽屉 + 占位页 + 应用图标）共用一套 token：
@@ -537,6 +585,7 @@ CDP（`http://127.0.0.1:9222/json/list`）脚本化验证界面与桥接（本�
 | v3.2 | 启动提速：start-service 直连 node bin.js（npx 兜底）+ 启动分段打点 + 试次阶梯与失败现场保留；`--port` 显式传递（修掉 config 端口不生效的隐患）；面板启动与依赖检测并行、过渡期 300ms 轮询；可选 V8 编译缓存钩子（实测无收益，默认关）；新增 defender-exclusions / clean-npx-cache / check-boot-perf / apply-panel-update |
 | v3.3 | 可靠性：端口冲突自动顺延 + 面板按 PID 校验采纳真实端口 + 重复启动直接复用；崩溃自动恢复改指数退避（5→300 秒）并以「连续健康 120 秒」复位；HTTP 健康检查（绕过代理，仅观测不重启）；日志被占用时自动改名；stop-dsh/check-boot-perf 跟随实际端口；新增更新提示（check-update.ps1，只提示不自动升级）与令牌鉴权的远程访问（start-remote.cmd + remote-proxy.mjs，HTTP+WebSocket 透传，默认关闭） |
 | v3.4.1 | 端口采纳收紧：`SyncActivePort` 现在**必须**有可验证的 pid 才采纳 `run/dsh-web.port`（此前 pid 读不到时只要求端口在监听，「残留 port 文件 + 别的程序占了该端口」会让内嵌浏览器导航到别人的服务）；pid 文件失效时一并删除端口记录。新增 `check-scripts.ps1` 编码/语法门禁并接入 `run-tests.cmd` 第一步 |
+| v3.8 | **更新 DSH**：启动自动查新版（12 秒后、24h 节流），有新版在顶栏「设置」按钮右上角**亮红点** + 托盘气泡；设置页新增「DeepSeek Harness 更新」分区（当前/最新/上次检查 + 检查更新 / 更新到最新版 / 更新插件）。升级本体走新脚本 `update-dsh.ps1`（npx 显式 `@<版本>` 预热、先备份 `~/.dsh/sessions`、结果写 `run/update-check.txt`、过程写 `run/update-apply.log`，脚本不重启服务，成功后由面板询问重启）；插件走 `update-plugins.ps1`（`dsh plugin --profile web update`）。`check-update.ps1` 增加版本比较与 `-WithTags`；启动器/面板/启动器的入口定位由「mtime 最新」改为「**版本最高**」 |
 | v3.7.2 | 修掉顶栏「工作台 / 设置」按钮外面的**方形外框**（鼠标移上去又消失）：把这两个按钮和状态胶囊从 `Button` 改成自绘 `Control`——`Button` 即使 `FlatStyle=Flat` + `BorderSize=0`，在窗口重新激活或高 DPI 重绘时仍可能露出系统画的方框；自绘 `Control` 没有 `FlatAppearance`/`BorderStyle` 这类属性，且常态**既无边框也无底色**（只有文字，悬停才浮出浅蓝底）。`Click` 由 `OnMouseUp` 自己发（关掉 `StandardClick` 防重复），已用真实鼠标点击验证「设置」仍能打开设置页 |
 | v3.7.1 | 修复设置页「重新检测」点了之后一直停在「检测中…」：检测本身 1 秒就返回（`run/dsh-check.txt` 写入 `installed`），但三处检测入口各写一遍、没有一处刷新设置页标签。现在统一走 `BeginDshCheck()`——防重入（连点不再起一堆 PowerShell）、检测中把按钮置灰并显示「检测中…」、结果回来经 `RefreshDshStatusLabels()` 刷新标签；已用 UI 自动化真点一次验证：`已就绪 → 检测中… → 已就绪` |
 | v3.7 | **界面统一**：整套 UI 收敛到蓝 + 白单一色系与大圆角——`Theme` 重写（品牌蓝 #2F6BFF、浅蓝底/深蓝字、冷蓝灰线与四级文字），顶栏白底 + 蓝色品牌标 + URL 浅蓝 chip，状态胶囊改成「浅底 + 同色深字 + 实心点」，按钮/开关/卡片/输入框统一圆角与边框，占位页与工作台同步换色；应用图标、Header Logo、托盘图标、工作台品牌标统一成同一枚「›_」标记（圆头线段、无尖角）；新增「界面设计规范」一节 |
