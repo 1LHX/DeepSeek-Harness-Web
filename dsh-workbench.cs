@@ -36,7 +36,10 @@ namespace DshPanel
 {
 internal static class Wb
 {
-    internal const string Version = "3.8.0";
+    // 工作台版本跟随 exe 的 AssemblyVersion，避免两处版本号各写各的
+    //（曾经面板已是 3.9.x，工作台标题还显示 v3.8.0）。ToString(3) 只取 major.minor.build。
+    internal static readonly string Version =
+        System.Reflection.Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
 
     // ---------- 上限（都要有，否则一次误操作就能把面板拖死） ----------
     const int MaxTextRead = 2 * 1024 * 1024;        // 文本预览上限
